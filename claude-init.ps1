@@ -72,8 +72,8 @@ if (Test-Path $LoadoutClaude) {
 }
 
 # --- 2. Skills ---
-$LoadoutSkills = Join-Path $LoadoutPath ".claude" "skills"
-$TargetSkills = Join-Path $Target ".claude" "skills"
+$LoadoutSkills = Join-Path (Join-Path $LoadoutPath ".claude") "skills"
+$TargetSkills = Join-Path (Join-Path $Target ".claude") "skills"
 
 if (Test-Path $LoadoutSkills) {
     New-Item -ItemType Directory -Force -Path $TargetSkills | Out-Null
@@ -103,9 +103,9 @@ if (Test-Path $LoadoutSkills) {
 
 # --- 3. Hooks (merge into settings.local.json) ---
 # Support both: .claude/settings.local.json (preferred) or .claude/hooks.json (legacy)
-$LoadoutSettingsFile = Join-Path $LoadoutPath ".claude" "settings.local.json"
-$LoadoutHooksFile = Join-Path $LoadoutPath ".claude" "hooks.json"
-$TargetSettings = Join-Path $Target ".claude" "settings.local.json"
+$LoadoutSettingsFile = Join-Path (Join-Path $LoadoutPath ".claude") "settings.local.json"
+$LoadoutHooksFile = Join-Path (Join-Path $LoadoutPath ".claude") "hooks.json"
+$TargetSettings = Join-Path (Join-Path $Target ".claude") "settings.local.json"
 
 $hooksSource = $null
 if (Test-Path $LoadoutSettingsFile) {
