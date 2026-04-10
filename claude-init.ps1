@@ -172,19 +172,52 @@ if ($hooksSource) {
 $exclude = @("CLAUDE.md", ".claude")
 $extraFiles = Get-ChildItem -Path $LoadoutPath -Exclude $exclude
 
+# Helper: recursively copy a directory, prompting before overwriting any file
+function Copy-DirectoryWithPrompt {
+    param([string]$Source, [string]$Dest)
+    if (-not (Test-Path $Dest)) {
+        New-Item -ItemType Directory -Force -Path $Dest | Out-Null
+    }
+    foreach ($child in Get-ChildItem -Path $Source) {
+        $childDest = Join-Path $Dest $child.Name
+        if ($child.PSIsContainer) {
+            Copy-DirectoryWithPrompt -Source $child.FullName -Dest $childDest
+        } else {
+            Copy-FileWithPrompt -Source $child.FullName -Dest $childDest
+        }
+    }
+}
+
+function Copy-FileWithPrompt {
+    param([string]$Source, [string]$Dest)
+    if (Test-Path $Dest) {
+        $relPath = $Dest.Replace($Target, "").TrimStart("\", "/")
+        Write-Host "  [EXISTS]   '$relPath' already exists in target." -ForegroundColor DarkYellow
+        $overwrite = Read-Host "           Overwrite? (y/N)"
+        if ($overwrite -eq 'y' -or $overwrite -eq 'Y') {
+            Copy-Item -Path $Source -Destination $Dest -Force
+            Write-Host "           Overwritten." -ForegroundColor Yellow
+        } else {
+            Write-Host "           Skipped." -ForegroundColor DarkYellow
+        }
+    } else {
+        $destDir = Split-Path -Parent $Dest
+        if (-not (Test-Path $destDir)) {
+            New-Item -ItemType Directory -Force -Path $destDir | Out-Null
+        }
+        Copy-Item -Path $Source -Destination $Dest -Force
+        $relPath = $Dest.Replace($Target, "").TrimStart("\", "/")
+        Write-Host "  [COPIED]   $relPath" -ForegroundColor Green
+    }
+}
+
 foreach ($item in $extraFiles) {
     $destPath = Join-Path $Target $item.Name
     if ($item.PSIsContainer) {
-        # If target dir exists, copy contents into it (avoids nesting .git inside .git)
-        if (Test-Path $destPath) {
-            Copy-Item -Path (Join-Path $item.FullName "*") -Destination $destPath -Recurse -Force
-        } else {
-            Copy-Item -Path $item.FullName -Destination $destPath -Recurse -Force
-        }
+        Copy-DirectoryWithPrompt -Source $item.FullName -Dest $destPath
     } else {
-        Copy-Item -Path $item.FullName -Destination $destPath -Force
+        Copy-FileWithPrompt -Source $item.FullName -Dest $destPath
     }
-    Write-Host "  [COPIED]   $($item.Name)" -ForegroundColor Green
 }
 
 Write-Host "`nDone!" -ForegroundColor Cyan
