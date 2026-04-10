@@ -5,7 +5,8 @@ loadouts/
 scratchpad.md
 
 # Claude Code local settings (user-specific permissions)
-.claude/settings.local.json
+CLAUDE.md
+.claude/
 
 # OS
 Thumbs.db
