@@ -55,11 +55,16 @@ $TargetClaude = Join-Path $Target "CLAUDE.md"
 if (Test-Path $LoadoutClaude) {
     $loadoutContent = [System.IO.File]::ReadAllText($LoadoutClaude)
     if (Test-Path $TargetClaude) {
-        $date = Get-Date -Format "yyyy-MM-dd"
-        $separator = "`n`n---`n`n<!-- Loadout: $Loadout (applied $date) -->`n`n"
         $existing = [System.IO.File]::ReadAllText($TargetClaude)
-        [System.IO.File]::WriteAllText($TargetClaude, $existing + $separator + $loadoutContent)
-        Write-Host "  [APPENDED] CLAUDE.md" -ForegroundColor Yellow
+        # Check if this loadout content was already appended
+        if ($existing.Contains($loadoutContent.Trim())) {
+            Write-Host "  [SKIPPED]  CLAUDE.md (loadout content already present)" -ForegroundColor DarkYellow
+        } else {
+            $date = Get-Date -Format "yyyy-MM-dd"
+            $separator = "`n`n---`n`n<!-- Loadout: $Loadout (applied $date) -->`n`n"
+            [System.IO.File]::WriteAllText($TargetClaude, $existing + $separator + $loadoutContent)
+            Write-Host "  [APPENDED] CLAUDE.md" -ForegroundColor Yellow
+        }
     } else {
         [System.IO.File]::WriteAllText($TargetClaude, $loadoutContent)
         Write-Host "  [COPIED]   CLAUDE.md" -ForegroundColor Green
@@ -72,9 +77,28 @@ $TargetSkills = Join-Path $Target ".claude" "skills"
 
 if (Test-Path $LoadoutSkills) {
     New-Item -ItemType Directory -Force -Path $TargetSkills | Out-Null
-    Copy-Item -Path (Join-Path $LoadoutSkills "*") -Destination $TargetSkills -Recurse -Force
-    $skillCount = (Get-ChildItem -Path $LoadoutSkills -Directory).Count
-    Write-Host "  [COPIED]   .claude/skills/ ($skillCount skill(s))" -ForegroundColor Green
+    $skillItems = Get-ChildItem -Path $LoadoutSkills
+    $copiedCount = 0
+    $skippedCount = 0
+    foreach ($skill in $skillItems) {
+        $targetSkillPath = Join-Path $TargetSkills $skill.Name
+        if (Test-Path $targetSkillPath) {
+            Write-Host "  [EXISTS]   Skill '$($skill.Name)' already exists in target." -ForegroundColor DarkYellow
+            $overwrite = Read-Host "           Overwrite? (y/N)"
+            if ($overwrite -eq 'y' -or $overwrite -eq 'Y') {
+                Copy-Item -Path $skill.FullName -Destination $TargetSkills -Recurse -Force
+                $copiedCount++
+                Write-Host "           Overwritten." -ForegroundColor Yellow
+            } else {
+                $skippedCount++
+                Write-Host "           Skipped." -ForegroundColor DarkYellow
+            }
+        } else {
+            Copy-Item -Path $skill.FullName -Destination $TargetSkills -Recurse -Force
+            $copiedCount++
+        }
+    }
+    Write-Host "  [SKILLS]   $copiedCount copied, $skippedCount skipped" -ForegroundColor Green
 }
 
 # --- 3. Hooks (merge into settings.local.json) ---
@@ -100,12 +124,42 @@ if ($hooksSource) {
         $settings = [PSCustomObject]@{}
     }
 
-    # Replace or add the hooks key
+    # Merge hooks per-event, avoiding duplicates
     if ($hooksData.PSObject.Properties["hooks"]) {
-        if ($settings.PSObject.Properties["hooks"]) {
-            $settings.hooks = $hooksData.hooks
-        } else {
-            $settings | Add-Member -NotePropertyName "hooks" -NotePropertyValue $hooksData.hooks
+        if (-not $settings.PSObject.Properties["hooks"]) {
+            $settings | Add-Member -NotePropertyName "hooks" -NotePropertyValue ([PSCustomObject]@{})
+        }
+        $newHooks = $hooksData.hooks
+        foreach ($event in $newHooks.PSObject.Properties) {
+            $eventName = $event.Name
+            $newEntries = @($event.Value)
+            if ($settings.hooks.PSObject.Properties[$eventName]) {
+                $existingEntries = @($settings.hooks.$eventName)
+                $addedCount = 0
+                foreach ($newEntry in $newEntries) {
+                    $newCmd = $newEntry.command
+                    $isDuplicate = $false
+                    foreach ($existing in $existingEntries) {
+                        if ($existing.command -eq $newCmd) {
+                            $isDuplicate = $true
+                            break
+                        }
+                    }
+                    if (-not $isDuplicate) {
+                        $existingEntries += $newEntry
+                        $addedCount++
+                    }
+                }
+                $settings.hooks.$eventName = $existingEntries
+                if ($addedCount -gt 0) {
+                    Write-Host "  [MERGED]   $addedCount new hook(s) into '$eventName'" -ForegroundColor Green
+                } else {
+                    Write-Host "  [SKIPPED]  '$eventName' hooks already present" -ForegroundColor DarkYellow
+                }
+            } else {
+                $settings.hooks | Add-Member -NotePropertyName $eventName -NotePropertyValue $newEntries
+                Write-Host "  [ADDED]    '$eventName' hooks ($($newEntries.Count) entry/entries)" -ForegroundColor Green
+            }
         }
     }
 
