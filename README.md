@@ -1,3 +1,5 @@
+TESTING
+
 # Claude Code Loadouts
 
 Reusable configuration templates for [Claude Code](https://docs.anthropic.com/en/docs/claude-code) projects. A loadout packages up a CLAUDE.md, skills, hooks, and other files so you can apply a consistent setup across repos with one command.
