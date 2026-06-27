@@ -38,14 +38,14 @@ For each selected skill:
 
 Good default coverage to consider, only when the repo justifies it: primary framework, language/runtime, database/storage, auth/security, test strategy, deployment/ops, UI/design system, performance, code review, release/publish readiness.
 
-## 4. Add repo instructions for OMP skill usage
+## 4. Add repo instructions for OMP skills
 
 Ensure the repo instruction file (`AGENTS.md` when present, otherwise create it) contains concise OMP guidance:
 
-- when loading any skill, record the load with `python ./.omp/scripts/skill-usage-manager.py record <skill-name> --scope repo --path ./.omp/skills --repo .` if `.omp/scripts/skill-usage-manager.py` exists;
 - read `skill://<skill-name>` before following a skill;
 - prefer repo-local commands from the README or package manifests;
 - never commit secrets or generated cache artifacts.
+- periodically use `skill://optimize-repo-skills` when the repo's skill set needs review, pruning, or expansion.
 
 If a different instruction file already owns this policy, update that file instead of duplicating it.
 

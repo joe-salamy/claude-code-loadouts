@@ -18,7 +18,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Sequence
 
-EMPTY_SKILL_USAGE_LEDGER = {"version": 1, "scopes": {}}
 WORKFLOW_STATE_FILENAME = "workflow-state.json"
 MAX_LOG_OUTPUT_CHARS = 20_000
 DEFAULT_BASE_CANDIDATES = ("main", "master")
@@ -769,7 +768,6 @@ class HarnessWorktreeFlow:
         self, repo: Path, plan: Path, state: WorkflowState, names: Names
     ) -> tuple[WorkflowState, Path]:
         state, plan_in_worktree = self.ensure_plan_stage(repo, plan, state, names)
-        state = self.ensure_skill_usage_baseline(repo, state, names)
         state = self.ensure_implementation_complete(state, names, plan_in_worktree)
         state = self.ensure_audit_complete(state, names, plan_in_worktree)
         return state, plan_in_worktree
@@ -807,23 +805,6 @@ class HarnessWorktreeFlow:
             )
         return state, plan_in_worktree
 
-    def ensure_skill_usage_baseline(
-        self, repo: Path, state: WorkflowState, names: Names
-    ) -> WorkflowState:
-        baseline = names.worktree / self.handoff_dir / "skill-usage-baseline.json"
-        if not baseline.exists():
-            self.snapshot_skill_usage_baseline(names.worktree, repo)
-            state = self.update_workflow_state(
-                state, completed_stage="skill_usage_baseline_snapshotted"
-            )
-            self.print_checkpoint(
-                "done", "Skill usage baseline", (("baseline", baseline),)
-            )
-        else:
-            self.print_checkpoint(
-                "skip", "Skill usage baseline", (("baseline", baseline),)
-            )
-        return state
 
     def ensure_implementation_complete(
         self, state: WorkflowState, names: Names, plan_in_worktree: Path
@@ -1203,24 +1184,15 @@ Write `{summary.as_posix()}` before finishing.
         integration_plan = self.integration_plan_path(
             names.worktree, integration_worktree, plan_path
         )
-        feature_baseline = (
-            integration_worktree / self.handoff_dir / "skill-usage-baseline.json"
-        )
 
         integrated = False
         archive_dir: Path | None = None
         try:
-            skill_usage_restored = False
             integration_has_commits = self.branch_has_commits_since_base(
                 integration_worktree, integration_branch
             )
             if self.has_unmerged_paths(integration_worktree):
-                unmerged = self.unmerged_paths(integration_worktree)
-                if unmerged:
-                    self.restore_integration_skill_usage_to_head(
-                        integration_worktree, repo
-                    )
-                    skill_usage_restored = True
+                pass
             elif (
                 self.has_non_handoff_changes(integration_worktree)
                 and not integration_has_commits
@@ -1237,11 +1209,8 @@ Write `{summary.as_posix()}` before finishing.
                     integration_worktree,
                     check=False,
                 )
-                skill_usage_restored = (
-                    self.handle_merge_failure(
-                        merge, integration_worktree, repo, "squash_merge"
-                    )
-                    or skill_usage_restored
+                self.handle_merge_failure(
+                    merge, integration_worktree, repo, "squash_merge"
                 )
                 self.print_checkpoint(
                     "done", "Squash merge", (("feature branch", names.branch),)
@@ -1255,11 +1224,8 @@ Write `{summary.as_posix()}` before finishing.
                     integration_worktree,
                     check=False,
                 )
-                skill_usage_restored = (
-                    self.handle_merge_failure(
-                        merge, integration_worktree, repo, "no_ff_merge"
-                    )
-                    or skill_usage_restored
+                self.handle_merge_failure(
+                    merge, integration_worktree, repo, "no_ff_merge"
                 )
                 self.print_checkpoint(
                     "done", "No-ff merge", (("feature branch", names.branch),)
@@ -1275,7 +1241,7 @@ Write `{summary.as_posix()}` before finishing.
                 / self.handoff_dir
                 / "post-conflict-audit-summary.md"
             )
-            self.resolve_non_skill_conflicts(
+            self.resolve_merge_conflicts(
                 integration_worktree, names, integration_plan, conflict_summary
             )
             self.run_post_conflict_audit_if_needed(
@@ -1285,16 +1251,12 @@ Write `{summary.as_posix()}` before finishing.
                 post_conflict_summary,
             )
 
-            if not skill_usage_restored:
-                self.restore_integration_skill_usage_to_head(integration_worktree, repo)
 
             state = self.commit_integration_if_needed(
                 state,
                 names,
                 integration_worktree,
                 integration_branch,
-                feature_baseline,
-                repo,
             )
             state = self.fast_forward_base_if_needed(
                 repo, state, names, integration_branch
@@ -1333,12 +1295,11 @@ Write `{summary.as_posix()}` before finishing.
             raise FlowError(format_command_failure(result))
         unmerged = self.unmerged_paths(integration_worktree)
         if unmerged:
-            self.restore_integration_skill_usage_to_head(integration_worktree, repo)
             return True
         self.log_command_result("command_failure", result, phase="finish", step=step)
         raise FlowError(format_command_failure(result))
 
-    def resolve_non_skill_conflicts(
+    def resolve_merge_conflicts(
         self,
         integration_worktree: Path,
         names: Names,
@@ -1346,14 +1307,10 @@ Write `{summary.as_posix()}` before finishing.
         conflict_summary: Path,
     ) -> None:
         if self.has_unmerged_paths(integration_worktree):
-            unmerged = self.unmerged_paths(integration_worktree)
-            if not self.only_skill_usage_unmerged(unmerged):
-                if not conflict_summary.exists():
-                    self.run_conflict_resolution(
-                        integration_worktree, names, integration_plan
-                    )
-                if self.has_unmerged_paths(integration_worktree):
-                    raise FlowError("Merge conflicts remain after conflict resolution.")
+            if not conflict_summary.exists():
+                self.run_conflict_resolution(
+                    integration_worktree, names, integration_plan
+                )
             if self.has_unmerged_paths(integration_worktree):
                 raise FlowError("Merge conflicts remain after conflict resolution.")
 
@@ -1373,8 +1330,6 @@ Write `{summary.as_posix()}` before finishing.
         names: Names,
         integration_worktree: Path,
         integration_branch: str,
-        feature_baseline: Path,
-        repo: Path,
     ) -> WorkflowState:
         if not self.branch_has_commits_since_base(
             integration_worktree, integration_branch
@@ -1383,12 +1338,6 @@ Write `{summary.as_posix()}` before finishing.
                 "start",
                 "Integration commit",
                 (("branch", integration_branch), ("worktree", integration_worktree)),
-            )
-            self.consolidate_skill_usage(
-                names.worktree, integration_worktree, repo, feature_baseline
-            )
-            state = self.update_workflow_state(
-                state, completed_stage="skill_usage_consolidated"
             )
             self.stage_integration_changes(integration_worktree)
             state = self.update_workflow_state(
@@ -1600,117 +1549,12 @@ Do not commit.
             check=False,
         )
 
-    def skill_usage_script(self, worktree: Path) -> Path:
-        return worktree / self.harness_dir / "scripts" / "skill-usage-manager.py"
 
-    def skill_usage_harness_dir_candidates(self) -> tuple[str, ...]:
-        return (
-            self.harness_dir.as_posix(),
-            ".harness",
-            ".codex",
-            ".opencode",
-            ".claude",
-            ".omp",
-            ".agents",
-        )
 
-    def skill_usage_ledger(self, repo_root: Path) -> Path:
-        for harness_dir in self.skill_usage_harness_dir_candidates():
-            candidate = repo_root / harness_dir
-            if candidate.exists():
-                return candidate / "skill-usage.json"
-        return repo_root / ".skill-usage.json"
 
-    def skill_usage_ledger_in_worktree(
-        self, worktree: Path, reference_repo: Path
-    ) -> Path:
-        rel = self.skill_usage_ledger(reference_repo).relative_to(reference_repo)
-        return worktree / rel
 
-    def snapshot_skill_usage_baseline(
-        self, worktree: Path, reference_repo: Path | None = None
-    ) -> Path:
-        baseline = worktree / self.handoff_dir / "skill-usage-baseline.json"
-        ledger = (
-            self.skill_usage_ledger_in_worktree(worktree, reference_repo)
-            if reference_repo is not None
-            else self.skill_usage_ledger(worktree)
-        )
-        if self.runner.dry_run:
-            print(f"+ snapshot skill usage {ledger} {baseline}")
-            return baseline
-        self.ensure_dir(baseline.parent)
-        if ledger.exists():
-            self.copy_file(ledger, baseline)
-        else:
-            baseline.write_text(
-                json.dumps(EMPTY_SKILL_USAGE_LEDGER, indent=2, sort_keys=True) + "\n",
-                encoding="utf-8",
-                newline="\n",
-            )
-        return baseline
 
-    def restore_integration_skill_usage_to_head(
-        self, integration_worktree: Path, reference_repo: Path | None = None
-    ) -> None:
-        ledger = (
-            self.skill_usage_ledger_in_worktree(integration_worktree, reference_repo)
-            if reference_repo is not None
-            else self.skill_usage_ledger(integration_worktree)
-        )
-        rel = ledger.relative_to(integration_worktree).as_posix()
-        exists_at_head = (
-            self.runner.run(
-                ["git", "cat-file", "-e", f"HEAD:{rel}"],
-                integration_worktree,
-                check=False,
-            ).returncode
-            == 0
-        )
-        if exists_at_head:
-            self.runner.run(
-                ["git", "checkout", "HEAD", "--", rel], integration_worktree
-            )
-        else:
-            self.runner.run(
-                ["git", "rm", "-f", "--ignore-unmatch", "--", rel],
-                integration_worktree,
-                check=False,
-            )
-            if not self.runner.dry_run and ledger.exists():
-                ledger.unlink()
 
-    def consolidate_skill_usage(
-        self,
-        source_worktree: Path,
-        integration_worktree: Path,
-        target_repo: Path,
-        baseline_path: Path,
-    ) -> None:
-        self.runner.run(
-            [
-                sys.executable,
-                str(self.skill_usage_script(integration_worktree)),
-                "consolidate",
-                "--source-ledger",
-                str(self.skill_usage_ledger_in_worktree(source_worktree, target_repo)),
-                "--base-ledger",
-                str(baseline_path),
-                "--target-ledger",
-                str(
-                    self.skill_usage_ledger_in_worktree(
-                        integration_worktree, target_repo
-                    )
-                ),
-                "--source-repo",
-                str(source_worktree),
-                "--target-repo",
-                str(target_repo),
-                "--target-worktree",
-                str(integration_worktree),
-            ],
-            integration_worktree,
-        )
 
     def prepare_primary_for_fast_forward(
         self, repo: Path, integration_branch: str, run_id: str
@@ -1804,14 +1648,6 @@ Do not commit.
         )
         return [line.strip() for line in result.stdout.splitlines() if line.strip()]
 
-    def only_skill_usage_unmerged(self, paths: Sequence[str]) -> bool:
-        expected = {
-            f"{harness_dir}/skill-usage.json"
-            for harness_dir in self.skill_usage_harness_dir_candidates()
-        }
-        return bool(paths) and all(
-            path.replace("\\", "/") in expected for path in paths
-        )
 
     def require_no_tracked_handoff_artifacts(
         self, worktree: Path, treeish: str
@@ -1921,8 +1757,6 @@ Do not commit.
         handoff = self.handoff_dir.as_posix().rstrip("/")
         harness = self.harness_dir.as_posix().rstrip("/")
         if normalized == handoff or normalized.startswith(f"{handoff}/"):
-            return True
-        if normalized == f"{harness}/skill-usage.json":
             return True
         if normalized == f"{harness}/worktree-flow" or normalized.startswith(
             f"{harness}/worktree-flow/"

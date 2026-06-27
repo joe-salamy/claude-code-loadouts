@@ -372,62 +372,7 @@ class SharedHarnessSelectionTests(unittest.TestCase):
             self.assertEqual(output_file.read_text(encoding="utf-8"), "Final response")
             self.assertFalse(prompt_file.exists())
 
-    def test_omp_consolidates_existing_repo_ledger_not_created_omp_ledger(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            repo = root / "repo"
-            feature = root / "repo-feature"
-            integration = root / "repo-integration"
-            (repo / ".codex").mkdir(parents=True)
-            (integration / ".omp").mkdir(parents=True)
-            baseline = feature / ".omp" / "handoff" / "skill-usage-baseline.json"
-            runner = FakeRunner()
-            config = flow.FlowConfig(
-                repo=repo,
-                plan=repo / "plan.md",
-                base="main",
-                model=None,
-                harness="omp",
-                harness_dir=Path(".omp"),
-                merge_mode="squash",
-                keep_worktrees=False,
-            )
 
-            flow.HarnessWorktreeFlow(config, runner).consolidate_skill_usage(
-                feature,
-                integration,
-                repo,
-                baseline,
-            )
-
-            args = runner.calls[-1][0]
-            self.assertEqual(
-                args[args.index("--source-ledger") + 1],
-                str(feature / ".codex" / "skill-usage.json"),
-            )
-            self.assertEqual(
-                args[args.index("--target-ledger") + 1],
-                str(integration / ".codex" / "skill-usage.json"),
-            )
-
-    def test_omp_treats_codex_skill_usage_conflict_as_usage_only(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            repo = Path(temp) / "repo"
-            repo.mkdir()
-            config = flow.FlowConfig(
-                repo=repo,
-                plan=repo / "plan.md",
-                base="main",
-                model=None,
-                harness="omp",
-                harness_dir=Path(".omp"),
-                merge_mode="squash",
-                keep_worktrees=False,
-            )
-
-            subject = flow.HarnessWorktreeFlow(config, FakeRunner())
-
-            self.assertTrue(subject.only_skill_usage_unmerged([".codex/skill-usage.json"]))
 
 
 class HarnessWorktreeFlowTests(unittest.TestCase):
@@ -1093,23 +1038,8 @@ class HarnessWorktreeFlowTests(unittest.TestCase):
             self.assertIn("Do not commit files under `.codex/handoff/`", prompts[-2])
             self.assertIn("Do not commit files under `.codex/handoff/`", prompts[-1])
 
-    def test_snapshot_skill_usage_baseline_writes_empty_ledger_when_absent(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            worktree = Path(temp) / "repo-feature"
-            (worktree / ".codex").mkdir(parents=True)
-            subject = flow.HarnessWorktreeFlow(
-                self.config(worktree, worktree / "plan.md"), FakeRunner()
-            )
 
-            baseline = subject.snapshot_skill_usage_baseline(worktree)
-
-            self.assertEqual(baseline, worktree / ".codex" / "handoff" / "skill-usage-baseline.json")
-            self.assertEqual(
-                json.loads(baseline.read_text(encoding="utf-8")),
-                {"version": 1, "scopes": {}},
-            )
-
-    def test_finish_restores_and_consolidates_before_staging_in_squash_mode(self) -> None:
+    def test_finish_stages_integration_changes_in_squash_mode(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             repo = Path(temp) / "repo"
             feature = Path(temp) / "repo-plan"
@@ -1117,14 +1047,9 @@ class HarnessWorktreeFlowTests(unittest.TestCase):
             repo.mkdir()
             plan.parent.mkdir(parents=True)
             plan.write_text("# Plan", encoding="utf-8")
-            handoff = feature / ".codex" / "handoff"
-            handoff.mkdir(parents=True)
-            (handoff / "skill-usage-baseline.json").write_text("{}", encoding="utf-8")
             subject = flow.HarnessWorktreeFlow(self.config(repo, plan), FakeRunner())
             subject.prepare_harness_permissions = lambda _path: None
             events: list[str] = []
-            subject.restore_integration_skill_usage_to_head = lambda *_args: events.append("restore")
-            subject.consolidate_skill_usage = lambda *_args: events.append("consolidate")
             subject.stage_integration_changes = lambda _worktree: events.append("stage")
             subject.has_staged_non_handoff_changes = lambda _worktree: True
             subject.archive_handoff = lambda *_args: repo / ".codex" / "archive"
@@ -1138,30 +1063,9 @@ class HarnessWorktreeFlowTests(unittest.TestCase):
                 plan,
             )
 
-            self.assertEqual(events, ["restore", "consolidate", "stage"])
+            self.assertEqual(events, ["stage"])
 
 
-    def test_consolidate_skill_usage_targets_primary_repo_paths(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            feature = root / "repo-plan"
-            integration = root / "repo-integrate"
-            repo = root / "repo"
-            baseline = feature / ".codex" / "handoff" / "skill-usage-baseline.json"
-            runner = FakeRunner()
-
-            flow.HarnessWorktreeFlow(self.config(repo, repo / "plan.md"), runner).consolidate_skill_usage(
-                feature,
-                integration,
-                repo,
-                baseline,
-            )
-
-            args = runner.calls[-1][0]
-            self.assertIn("--target-repo", args)
-            self.assertEqual(args[args.index("--target-repo") + 1], str(repo))
-            self.assertIn("--target-worktree", args)
-            self.assertEqual(args[args.index("--target-worktree") + 1], str(integration))
 
     def test_no_ff_merge_uses_no_commit_and_workflow_commit(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -1176,8 +1080,6 @@ class HarnessWorktreeFlowTests(unittest.TestCase):
                 self.config(repo, plan, merge_mode="no-ff"), FakeRunner()
             )
             subject.prepare_harness_permissions = lambda _path: None
-            subject.restore_integration_skill_usage_to_head = lambda *_args: None
-            subject.consolidate_skill_usage = lambda *_args: None
             subject.stage_integration_changes = lambda _worktree: None
             subject.has_staged_non_handoff_changes = lambda _worktree: True
             subject.archive_handoff = lambda *_args: repo / ".codex" / "archive"
@@ -1196,60 +1098,9 @@ class HarnessWorktreeFlowTests(unittest.TestCase):
             self.assertIn(("git", "commit", "-m", "Harness: Plan"), calls)
             self.assertNotIn(("git", "merge", "--continue"), calls)
 
-    def test_restore_skill_usage_to_head_restores_tracked_ledger(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            repo = Path(temp) / "repo"
-            (repo / ".codex").mkdir(parents=True)
-            runner = FakeRunner(
-                {
-                    ("git", "cat-file", "-e", "HEAD:.codex/skill-usage.json"): flow.CommandResult(
-                        ("git", "cat-file", "-e", "HEAD:.codex/skill-usage.json"),
-                        repo,
-                        0,
-                    )
-                }
-            )
-            subject = flow.HarnessWorktreeFlow(self.config(repo, repo / "plan.md"), runner)
 
-            subject.restore_integration_skill_usage_to_head(repo)
 
-            calls = [call[0] for call in runner.calls]
-            self.assertIn(("git", "checkout", "HEAD", "--", ".codex/skill-usage.json"), calls)
-
-    def test_only_skill_usage_conflict_skips_resolver(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            repo = Path(temp) / "repo"
-            feature = Path(temp) / "repo-plan"
-            plan = feature / "docs" / "plans" / "plan.md"
-            repo.mkdir()
-            plan.parent.mkdir(parents=True)
-            plan.write_text("# Plan", encoding="utf-8")
-            (feature / ".codex" / "handoff").mkdir(parents=True)
-            subject = flow.HarnessWorktreeFlow(
-                self.config(repo, plan),
-                FailingSquashMergeRunner(unmerged_paths=".codex/skill-usage.json\n"),
-            )
-            subject.prepare_harness_permissions = lambda _path: None
-            subject.run_conflict_resolution = lambda *_args: (_ for _ in ()).throw(
-                AssertionError("resolver should not run for usage-only conflicts")
-            )
-            subject.restore_integration_skill_usage_to_head = lambda *_args: None
-            subject.consolidate_skill_usage = lambda *_args: None
-            subject.stage_integration_changes = lambda _worktree: None
-            subject.archive_handoff = lambda *_args: repo / ".codex" / "archive"
-            subject.has_unmerged_paths = lambda _worktree: False
-            subject.has_staged_non_handoff_changes = lambda _worktree: True
-            subject.update_workflow_state = lambda state, **changes: flow.replace(state, **changes)
-            subject.require_ready_for_integration = lambda _worktree, _branch: None
-
-            subject.finish(
-                repo,
-                self.workflow_state(feature, merge_mode=subject.config.merge_mode),
-                flow.Names("plan", "feature/plan", feature, "plan-run"),
-                plan,
-            )
-
-    def test_conflict_restores_skill_usage_before_resolver(self) -> None:
+    def test_conflict_runs_resolver_before_integration_stage(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             repo = Path(temp) / "repo"
             feature = Path(temp) / "repo-plan"
@@ -1264,9 +1115,7 @@ class HarnessWorktreeFlowTests(unittest.TestCase):
             )
             subject.prepare_harness_permissions = lambda _path: None
             events: list[str] = []
-            subject.restore_integration_skill_usage_to_head = lambda *_args: events.append("restore")
             subject.run_conflict_resolution = lambda *_args: events.append("resolve")
-            subject.consolidate_skill_usage = lambda *_args: events.append("consolidate")
             subject.stage_integration_changes = lambda _worktree: events.append("stage")
             subject.archive_handoff = lambda *_args: repo / ".codex" / "archive"
             unmerged_checks = iter([False, True, False, False])
@@ -1282,7 +1131,7 @@ class HarnessWorktreeFlowTests(unittest.TestCase):
                 plan,
             )
 
-            self.assertEqual(events, ["restore", "resolve", "consolidate", "stage"])
+            self.assertEqual(events, ["resolve", "stage"])
 
     def test_plan_outside_repo_is_copied(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -1489,7 +1338,6 @@ class HarnessWorktreeFlowTests(unittest.TestCase):
             subject = flow.HarnessWorktreeFlow(self.config(repo, plan), runner)
             subject.create_feature_worktree = lambda _repo, _names: None
             subject.ensure_plan_in_worktree = lambda *_args: plan
-            subject.snapshot_skill_usage_baseline = lambda *_args: None
             subject.run_implementation = lambda *_args: None
             subject.require_file = lambda _path: None
             subject.require_no_tracked_handoff_artifacts = lambda *_args: None

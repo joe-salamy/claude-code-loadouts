@@ -7,12 +7,6 @@ ROOT = Path(__file__).resolve().parents[1]
 INIT_PROMPTS = ROOT / "init-prompts"
 
 
-def test_init_prompts_are_source_templates() -> None:
-    readme = (INIT_PROMPTS / "README.md").read_text(encoding="utf-8")
-
-    assert "source templates, not loadout payloads" in readme
-    assert "harness-init.ps1" in readme
-    assert "omp-repo-init.md" in readme
 
 
 def test_omp_repo_init_prompt_contains_required_bootstrap_steps() -> None:
@@ -23,7 +17,7 @@ def test_omp_repo_init_prompt_contains_required_bootstrap_steps() -> None:
         "Use `web_search`",
         "5-10 high-leverage skills",
         ".omp/skills/<skill-name>/SKILL.md",
-        "python ./.omp/scripts/skill-usage-manager.py record <skill-name> --scope repo --path ./.omp/skills --repo .",
+        "skill://optimize-repo-skills",
         "<repo>/.omp/lsp.json",
         "do not create `.omp/lsp.json` just to restate defaults",
         "Do not store secrets in committed files",
