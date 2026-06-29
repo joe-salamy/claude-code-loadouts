@@ -6,7 +6,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 ACTIVE_SCRIPTS = ROOT / ".omp" / "scripts"
-LOADOUT_SCRIPTS = ROOT / "loadouts" / "worktrees" / ".harness" / "scripts"
+LOADOUT_SCRIPT_DIRS = (
+    ROOT / "loadouts" / "worktrees" / ".harness" / "scripts",
+    ROOT / "loadouts" / "worktrees" / ".opencode" / "scripts",
+)
 
 
 SCRIPT_PAIRS = (
@@ -21,20 +24,21 @@ def normalized_text(path: Path) -> str:
 
 class WorktreesLoadoutSyncTests(unittest.TestCase):
     def test_active_scripts_match_worktrees_loadout_templates(self) -> None:
-        for script_name in SCRIPT_PAIRS:
-            active = ACTIVE_SCRIPTS / script_name
-            loadout = LOADOUT_SCRIPTS / script_name
-            with self.subTest(script=script_name):
-                self.assertTrue(active.exists(), f"Missing active script: {active}")
-                self.assertTrue(loadout.exists(), f"Missing loadout script: {loadout}")
-                self.assertEqual(
-                    normalized_text(active),
-                    normalized_text(loadout),
-                    (
-                        f"{active} and {loadout} are out of sync. Update the "
-                        "active script and shipped worktrees loadout copy together."
-                    ),
-                )
+        for loadout_scripts in LOADOUT_SCRIPT_DIRS:
+            for script_name in SCRIPT_PAIRS:
+                active = ACTIVE_SCRIPTS / script_name
+                loadout = loadout_scripts / script_name
+                with self.subTest(script=script_name, loadout=loadout_scripts):
+                    self.assertTrue(active.exists(), f"Missing active script: {active}")
+                    self.assertTrue(loadout.exists(), f"Missing loadout script: {loadout}")
+                    self.assertEqual(
+                        normalized_text(active),
+                        normalized_text(loadout),
+                        (
+                            f"{active} and {loadout} are out of sync. Update the "
+                            "active script and shipped worktrees loadout copy together."
+                        ),
+                    )
 
 
 if __name__ == "__main__":

@@ -22,6 +22,7 @@ WORKFLOW_STATE_FILENAME = "workflow-state.json"
 MAX_LOG_OUTPUT_CHARS = 20_000
 DEFAULT_BASE_CANDIDATES = ("main", "master")
 WORKTREE_FLOW_DIRNAME = "worktree-flow"
+RUN_ID_TIMESTAMP_FORMAT = "%Y%m%d-%H%M%S"
 
 
 def decode_subprocess_output(value: object) -> str:
@@ -266,6 +267,11 @@ def derive_slug(plan_path: Path) -> str:
     return slugify(plan_title(plan_path))
 
 
+def timestamped_run_id(slug: str, *, stamp: str | None = None) -> str:
+    timestamp = stamp or datetime.now().strftime(RUN_ID_TIMESTAMP_FORMAT)
+    return f"{timestamp}-{slug}"
+
+
 def slug_from_branch(branch: str) -> str:
     if branch.startswith("feature/"):
         return branch.removeprefix("feature/")
@@ -350,6 +356,23 @@ class HarnessWorktreeFlow:
     def worktree_flow_dir(self) -> Path:
         return self.config.harness_dir / WORKTREE_FLOW_DIRNAME
 
+    def run_id_from_plan(self, repo: Path, plan: Path) -> str | None:
+        try:
+            source_rel = plan.resolve().relative_to(repo.resolve())
+        except ValueError:
+            return None
+        if source_rel.name != "plan.md":
+            return None
+        worktree_flow_dir = self.worktree_flow_dir
+        if worktree_flow_dir.is_absolute():
+            try:
+                worktree_flow_dir = worktree_flow_dir.resolve().relative_to(repo.resolve())
+            except ValueError:
+                return None
+        if source_rel.parent.parent == worktree_flow_dir:
+            return source_rel.parent.name
+        return None
+
     @property
     def handoff_dir(self) -> Path:
         return self.config.harness_dir / "handoff"
@@ -368,7 +391,9 @@ class HarnessWorktreeFlow:
         plan = self.config.plan.resolve()
         self.validate(repo, plan)
 
-        names = self.unique_feature_names(repo, derive_slug(plan))
+        names = self.unique_feature_names(
+            repo, derive_slug(plan), self.run_id_from_plan(repo, plan)
+        )
         self.prepare_harness_permissions(repo / self.harness_dir)
         self.prepare_git_permissions(repo)
         # Keep workflow logs inside the script-created worktree. Writing them in
@@ -565,10 +590,13 @@ class HarnessWorktreeFlow:
         root = result.stdout.strip()
         return Path(root).resolve() if root else start
 
-    def unique_feature_names(self, repo: Path, slug: str) -> Names:
+    def unique_feature_names(
+        self, repo: Path, slug: str, run_id: str | None = None
+    ) -> Names:
         repo_name = repo.name
         parent = repo.parent
         suffix = 1
+        stamp = datetime.now().strftime(RUN_ID_TIMESTAMP_FORMAT)
         while True:
             candidate_slug = slug if suffix == 1 else f"{slug}-{suffix}"
             branch = f"feature/{candidate_slug}"
@@ -577,8 +605,10 @@ class HarnessWorktreeFlow:
                 ["git", "branch", "--list", branch], repo
             ).stdout.strip()
             if not branch_exists and not worktree.exists():
-                run_id = datetime.now().strftime(f"{candidate_slug}-%Y%m%d-%H%M%S")
-                return Names(candidate_slug, branch, worktree, run_id)
+                candidate_run_id = run_id or timestamped_run_id(
+                    candidate_slug, stamp=stamp
+                )
+                return Names(candidate_slug, branch, worktree, candidate_run_id)
             suffix += 1
 
     def create_feature_worktree(self, repo: Path, names: Names) -> None:
@@ -608,9 +638,9 @@ class HarnessWorktreeFlow:
         self.prepare_git_permissions(worktree)
 
     def ensure_plan_in_worktree(
-        self, repo: Path, plan: Path, worktree: Path, slug: str
+        self, repo: Path, plan: Path, worktree: Path, names: Names
     ) -> Path:
-        rel = self.worktree_flow_dir / slug / "plan.md"
+        rel = self.worktree_flow_dir / names.run_id / "plan.md"
         if is_relative_to(plan, repo):
             source_rel = plan.relative_to(repo)
             if source_rel == rel:
@@ -636,7 +666,7 @@ class HarnessWorktreeFlow:
                 run_id = record.get("run_id")
                 if isinstance(run_id, str) and run_id:
                     return run_id
-        return datetime.now().strftime(f"{fallback_slug}-%Y%m%d-%H%M%S")
+        return timestamped_run_id(fallback_slug)
 
     def tracked_path_exists(self, worktree: Path, path: Path) -> bool:
         try:
@@ -650,9 +680,15 @@ class HarnessWorktreeFlow:
         )
         return result.returncode == 0
 
-    def remove_untracked_workflow_plan(self, worktree: Path, slug: str) -> None:
-        workflow_plans = (
-            worktree / self.worktree_flow_dir / slug / "plan.md",
+    def remove_untracked_workflow_plan(
+        self, worktree: Path, slug: str, run_id: str | None = None
+    ) -> None:
+        candidates = [run_id] if run_id else []
+        candidates.append(slug)
+        workflow_plans = tuple(
+            worktree / self.worktree_flow_dir / candidate / "plan.md"
+            for candidate in dict.fromkeys(candidates)
+        ) + (
             worktree / self.worktree_flow_dir / slug / ".plan.md",
             worktree / self.worktree_flow_dir / f"{slug}.md",
         )
@@ -749,6 +785,7 @@ class HarnessWorktreeFlow:
         self, repo: Path, state: WorkflowState, names: Names, plan_in_worktree: Path
     ) -> WorkflowState:
         archive_dir = self.archive_handoff(repo, names.worktree, names.run_id)
+        self.archive_plan(archive_dir, plan_in_worktree)
         state = self.update_workflow_state(
             state, completed_stage="stopped_before_merge"
         )
@@ -782,7 +819,9 @@ class HarnessWorktreeFlow:
             )
         elif state.completed_stage == "legacy_state_inferred":
             plan_in_worktree = self.copy_plan_to_handoff(plan, names.worktree)
-            self.remove_untracked_workflow_plan(names.worktree, names.slug)
+            self.remove_untracked_workflow_plan(
+                names.worktree, names.slug, names.run_id
+            )
             state = self.update_workflow_state(
                 state,
                 plan_path=str(plan_in_worktree),
@@ -793,7 +832,7 @@ class HarnessWorktreeFlow:
             )
         else:
             plan_in_worktree = self.ensure_plan_in_worktree(
-                repo, plan, names.worktree, names.slug
+                repo, plan, names.worktree, names
             )
             state = self.update_workflow_state(
                 state,
@@ -804,7 +843,6 @@ class HarnessWorktreeFlow:
                 "done", "Plan staging", (("plan", plan_in_worktree),)
             )
         return state, plan_in_worktree
-
 
     def ensure_implementation_complete(
         self, state: WorkflowState, names: Names, plan_in_worktree: Path
@@ -1262,7 +1300,7 @@ Write `{summary.as_posix()}` before finishing.
                 repo, state, names, integration_branch
             )
             state, archive_dir = self.archive_successful_handoff(
-                repo, state, integration_worktree
+                repo, state, integration_worktree, integration_plan
             )
             integrated = True
         finally:
@@ -1398,9 +1436,14 @@ Write `{summary.as_posix()}` before finishing.
         return state
 
     def archive_successful_handoff(
-        self, repo: Path, state: WorkflowState, integration_worktree: Path
+        self,
+        repo: Path,
+        state: WorkflowState,
+        integration_worktree: Path,
+        plan_path: Path,
     ) -> tuple[WorkflowState, Path]:
         archive_dir = self.archive_handoff(repo, integration_worktree, state.run_id)
+        self.archive_plan(archive_dir, plan_path)
         state = self.update_workflow_state(state, completed_stage="handoff_archived")
         self.print_checkpoint(
             "done", "Handoff archived", (("handoff archive", archive_dir),)
@@ -1532,7 +1575,7 @@ Do not commit.
         return dest_plan
 
     def archive_handoff(self, repo: Path, worktree: Path, run_id: str) -> Path:
-        archive_dir = repo / self.harness_dir / "worktree-flow" / run_id
+        archive_dir = repo / self.worktree_flow_dir / run_id
         self.ensure_dir(archive_dir)
         source = worktree / self.handoff_dir
         if source.exists():
@@ -1540,6 +1583,11 @@ Do not commit.
                 if item.is_file():
                     self.copy_file(item, archive_dir / item.name)
         return archive_dir
+
+    def archive_plan(self, archive_dir: Path, plan_path: Path) -> None:
+        if plan_path.exists():
+            self.ensure_dir(archive_dir)
+            self.copy_file(plan_path, archive_dir / "plan.md")
 
     def stage_integration_changes(self, worktree: Path) -> None:
         self.runner.run(["git", "add", "-A"], worktree)
@@ -1755,12 +1803,10 @@ Do not commit.
     def path_is_handoff(self, path: str) -> bool:
         normalized = path.replace("\\", "/").strip('"')
         handoff = self.handoff_dir.as_posix().rstrip("/")
-        harness = self.harness_dir.as_posix().rstrip("/")
+        worktree_flow = self.worktree_flow_dir.as_posix().rstrip("/")
         if normalized == handoff or normalized.startswith(f"{handoff}/"):
             return True
-        if normalized == f"{harness}/worktree-flow" or normalized.startswith(
-            f"{harness}/worktree-flow/"
-        ):
+        if normalized == worktree_flow or normalized.startswith(f"{worktree_flow}/"):
             return True
         return False
 

@@ -4,6 +4,7 @@ import importlib.util
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 
@@ -72,6 +73,56 @@ class SavePlanCommandTests(unittest.TestCase):
             message = str(context.exception)
             self.assertIn(".harness", message)
             self.assertIn("worktree-flow.py", message)
+
+    def test_copy_plan_uses_timestamped_slug_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            repo = Path(temp) / "repo"
+            source = Path(temp) / "source.md"
+            repo.mkdir()
+            source.write_text("# My Plan\n\nBody", encoding="utf-8")
+
+            with mock.patch.object(
+                save_plan,
+                "timestamped_run_id",
+                return_value="20260629-082455-my-plan",
+            ):
+                target = save_plan.copy_plan_to_worktree_flow(repo, source)
+
+            self.assertEqual(
+                target,
+                repo / ".omp" / "worktree-flow" / "20260629-082455-my-plan" / "plan.md",
+            )
+            self.assertEqual(target.read_text(encoding="utf-8"), "# My Plan\n\nBody")
+
+    def test_copy_plan_suffixes_same_second_directory_collision(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            repo = Path(temp) / "repo"
+            source = Path(temp) / "source.md"
+            existing = (
+                repo
+                / ".omp"
+                / "worktree-flow"
+                / "20260629-082455-my-plan"
+            )
+            existing.mkdir(parents=True)
+            source.write_text("# My Plan\n\nBody", encoding="utf-8")
+
+            with mock.patch.object(
+                save_plan,
+                "timestamped_run_id",
+                return_value="20260629-082455-my-plan",
+            ):
+                target = save_plan.copy_plan_to_worktree_flow(repo, source)
+
+            self.assertEqual(
+                target,
+                repo
+                / ".omp"
+                / "worktree-flow"
+                / "20260629-082455-my-plan-2"
+                / "plan.md",
+            )
+            self.assertEqual(target.read_text(encoding="utf-8"), "# My Plan\n\nBody")
 
 
 if __name__ == "__main__":

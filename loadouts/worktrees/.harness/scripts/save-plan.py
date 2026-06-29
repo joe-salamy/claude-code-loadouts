@@ -3,8 +3,8 @@
 
 The OMP plan-mode session records the current plan as a ``local://`` path in
 ``mode_change`` entries. This script resolves that session-local file, copies it
-unchanged to ``.omp/worktree-flow/<slug-from-h1>/plan.md``, verifies the copy, and
-prints the command that runs ``worktree-flow.py`` with the saved plan.
+unchanged to ``.omp/worktree-flow/<timestamp>-<slug-from-h1>/plan.md``, verifies
+the copy, and prints the command that runs ``worktree-flow.py`` with the saved plan.
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ import re
 import shutil
 import sys
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
@@ -45,6 +46,11 @@ def plan_title(plan_path: Path) -> str:
         if match:
             return match.group(1).strip()
     return plan_path.stem
+
+
+def timestamped_run_id(slug: str, *, stamp: str | None = None) -> str:
+    timestamp = stamp or datetime.now().strftime("%Y%m%d-%H%M%S")
+    return f"{timestamp}-{slug}"
 
 
 def local_url_path(value: str) -> str | None:
@@ -222,9 +228,22 @@ def resolve_source_arg(repo: Path, sessions_root: Path, source: str | None) -> P
     return PlanSource(path=path, source=str(path))
 
 
+def unique_worktree_flow_dir(root: Path, slug: str) -> Path:
+    run_id = timestamped_run_id(slug)
+    target = root / run_id
+    if not target.exists():
+        return target
+    for suffix in range(2, 1000):
+        candidate = root / f"{run_id}-{suffix}"
+        if not candidate.exists():
+            return candidate
+    raise RuntimeError(f"Could not choose a unique worktree-flow directory for {slug}")
+
+
 def copy_plan_to_worktree_flow(repo: Path, source: Path) -> Path:
     slug = slugify(plan_title(source))
-    target = repo / WORKTREE_FLOW_DIR / slug / "plan.md"
+    target_dir = unique_worktree_flow_dir(repo / WORKTREE_FLOW_DIR, slug)
+    target = target_dir / "plan.md"
     target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(source, target)
 
@@ -259,7 +278,7 @@ def command_for_plan(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Copy the latest OMP plan to .omp/worktree-flow/<slug>/plan.md."
+        description="Copy the latest OMP plan to .omp/worktree-flow/<timestamp>-<slug>/plan.md."
     )
     parser.add_argument("--repo", default=".", help="Repository root. Defaults to cwd.")
     parser.add_argument(

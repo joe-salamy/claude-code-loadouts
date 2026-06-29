@@ -421,6 +421,20 @@ class HarnessWorktreeFlowTests(unittest.TestCase):
             names = flow.HarnessWorktreeFlow(config, runner).unique_feature_names(repo, "example")
             self.assertEqual(names.branch, "feature/example-2")
             self.assertEqual(names.worktree.name, "repo-example-2")
+            self.assertRegex(names.run_id, r"^\d{8}-\d{6}-example-2$")
+
+    def test_run_id_from_saved_worktree_flow_plan_is_reused(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            repo = Path(temp) / "repo"
+            plan = repo / ".codex" / "worktree-flow" / "20260629-082455-plan" / "plan.md"
+            plan.parent.mkdir(parents=True)
+            plan.write_text("# Plan", encoding="utf-8")
+            subject = flow.HarnessWorktreeFlow(self.config(repo, plan), FakeRunner())
+
+            self.assertEqual(
+                subject.run_id_from_plan(repo, plan),
+                "20260629-082455-plan",
+            )
 
     def test_validate_auto_detects_master_when_main_is_absent(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -532,11 +546,25 @@ class HarnessWorktreeFlowTests(unittest.TestCase):
             repo = Path(temp) / "repo"
             worktree = Path(temp) / "repo-feature"
             plan = repo / "docs" / "plans" / "p.md"
-            target = worktree / ".codex" / "worktree-flow" / "plan" / "plan.md"
+            names = flow.Names(
+                "plan",
+                "feature/plan",
+                worktree,
+                "20260629-082455-plan",
+            )
+            target = (
+                worktree
+                / ".codex"
+                / "worktree-flow"
+                / "20260629-082455-plan"
+                / "plan.md"
+            )
             repo.mkdir()
             plan.parent.mkdir(parents=True)
             plan.write_text("# Plan", encoding="utf-8")
-            actual = flow.HarnessWorktreeFlow(self.config(repo, plan), FakeRunner()).ensure_plan_in_worktree(repo, plan, worktree, "plan")
+            actual = flow.HarnessWorktreeFlow(
+                self.config(repo, plan), FakeRunner()
+            ).ensure_plan_in_worktree(repo, plan, worktree, names)
             self.assertEqual(actual, target)
             self.assertEqual(actual.read_text(encoding="utf-8"), "# Plan")
 
@@ -549,11 +577,24 @@ class HarnessWorktreeFlowTests(unittest.TestCase):
             worktree.mkdir()
             plan.write_text("# External", encoding="utf-8")
 
+            names = flow.Names(
+                "external",
+                "feature/external",
+                worktree,
+                "20260629-082455-external",
+            )
             actual = flow.HarnessWorktreeFlow(
                 self.config(repo, plan), FakeRunner(dry_run=True)
-            ).ensure_plan_in_worktree(repo, plan, worktree, "external")
+            ).ensure_plan_in_worktree(repo, plan, worktree, names)
 
-            self.assertEqual(actual, worktree / ".codex" / "worktree-flow" / "external" / "plan.md")
+            self.assertEqual(
+                actual,
+                worktree
+                / ".codex"
+                / "worktree-flow"
+                / "20260629-082455-external"
+                / "plan.md",
+            )
             self.assertFalse(actual.exists())
 
     def test_dry_run_archive_handoff_does_not_mutate_filesystem(self) -> None:
@@ -736,7 +777,7 @@ class HarnessWorktreeFlowTests(unittest.TestCase):
             subject.require_audit_invariants = lambda _worktree, _branch, _head: None
             subject.require_commits_since_base = lambda *_args: None
             subject.require_branch_changed_since_base = lambda *_args: None
-            subject.unique_feature_names = lambda _repo, _slug: flow.Names(
+            subject.unique_feature_names = lambda _repo, _slug, _run_id=None: flow.Names(
                 "plan", "feature/plan", worktree, "plan-run"
             )
             subject.validate = lambda _repo, _plan: None
@@ -1141,8 +1182,23 @@ class HarnessWorktreeFlowTests(unittest.TestCase):
             repo.mkdir()
             worktree.mkdir()
             plan.write_text("# External", encoding="utf-8")
-            actual = flow.HarnessWorktreeFlow(self.config(repo, plan), FakeRunner()).ensure_plan_in_worktree(repo, plan, worktree, "external")
-            self.assertEqual(actual, worktree / ".codex" / "worktree-flow" / "external" / "plan.md")
+            names = flow.Names(
+                "external",
+                "feature/external",
+                worktree,
+                "20260629-082455-external",
+            )
+            actual = flow.HarnessWorktreeFlow(
+                self.config(repo, plan), FakeRunner()
+            ).ensure_plan_in_worktree(repo, plan, worktree, names)
+            self.assertEqual(
+                actual,
+                worktree
+                / ".codex"
+                / "worktree-flow"
+                / "20260629-082455-external"
+                / "plan.md",
+            )
             self.assertEqual(actual.read_text(encoding="utf-8"), "# External")
 
     def test_harness_command_includes_model_and_output_file(self) -> None:
@@ -1308,7 +1364,7 @@ class HarnessWorktreeFlowTests(unittest.TestCase):
             subject.require_commits_since_base = lambda *_args: None
             subject.require_branch_changed_since_base = lambda *_args: None
             subject.require_ready_for_integration = lambda _worktree, _branch: None
-            subject.unique_feature_names = lambda _repo, _slug: flow.Names("plan", "feature/plan", worktree, "plan-run")
+            subject.unique_feature_names = lambda _repo, _slug, _run_id=None: flow.Names("plan", "feature/plan", worktree, "plan-run")
             subject.validate = lambda _repo, _plan: None
             subject.finish = lambda *_args: (_ for _ in ()).throw(AssertionError("finish should not run"))
 
@@ -1347,7 +1403,7 @@ class HarnessWorktreeFlowTests(unittest.TestCase):
             subject.require_audit_invariants = lambda *_args: None
             subject.archive_handoff = lambda *_args: repo / ".codex" / "archive"
             subject.require_ready_for_integration = lambda *_args: None
-            subject.unique_feature_names = lambda _repo, _slug: flow.Names(
+            subject.unique_feature_names = lambda _repo, _slug, _run_id=None: flow.Names(
                 "plan", "feature/plan", worktree, "plan-run"
             )
             subject.validate = lambda _repo, _plan: None
