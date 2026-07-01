@@ -11,7 +11,12 @@ ENV/
 .tox/
 .nox/
 __pycache__/
+**/__pycache__/
 *.py[cod]
+*.pyc
+*.pyo
+*.pyd
+*$py.class
 
 # Build output and generated site/app folders
 dist/
