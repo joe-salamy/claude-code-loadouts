@@ -19,12 +19,16 @@ param(
     [switch]$List,
     [switch]$Force,
     [switch]$PlanChanges,
-    [switch]$SkipInstructionFile
+    [switch]$SkipInstructionFile,
+    [string]$InitPrompt,
+    [switch]$Headless,
+    [string]$Model
 )
 
 $ErrorActionPreference = "Stop"
 $ScriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $LoadoutsDir = Join-Path $ScriptRoot "loadouts"
+$InitPromptsDir = Join-Path $ScriptRoot "init-prompts"
 
 function Join-RepoPath {
     param([string]$Root, [string]$RelativePath)
@@ -729,11 +733,137 @@ function Save-LoadoutUsage {
     [System.IO.File]::WriteAllText($usagePath, $json, [System.Text.UTF8Encoding]::new($false))
 }
 
+function Resolve-InitPromptPath {
+    param([string]$Name)
+
+    if ([string]::IsNullOrWhiteSpace($Name)) {
+        throw "Init prompt name is required."
+    }
+    if ($Name.Contains("/") -or $Name.Contains("\") -or $Name.Contains("..")) {
+        throw "Init prompt name must be a file name under init-prompts."
+    }
+
+    $fileName = if ($Name.EndsWith(".md", [System.StringComparison]::OrdinalIgnoreCase)) { $Name } else { "$Name.md" }
+    $candidate = Join-Path $InitPromptsDir $fileName
+    if (-not (Test-Path $candidate -PathType Leaf)) {
+        throw "Init prompt '$Name' not found in '$InitPromptsDir'."
+    }
+    return $candidate
+}
+
+function New-HeadlessInitPrompt {
+    param([string]$PromptPath, [string]$Target)
+
+    $prompt = [System.IO.File]::ReadAllText($PromptPath)
+    $rules = @'
+## Headless initialization execution rules
+
+The repository may already satisfy some or all items in this initialization prompt. Treat the prompt as an end-state checklist: inspect first, skip work that is already complete, and make only the changes needed to ensure every requested item is complete by the end of the run.
+
+Before your final response, create `.omp/init/reports/` in this repository if needed and write a timestamped Markdown report there named `yyyyMMdd-HHmmss-init-report.md`. The report must summarize what you changed, which verification commands ran, which checks could not run, and any follow-up needed. Keep the final chat response brief and mention the report path.
+'@
+    return "$prompt`n`n$rules"
+}
+
+function Invoke-OmpHeadlessInitPrompt {
+    param([string]$Target, [string]$PromptPath, [string]$Model)
+
+    $promptName = [System.IO.Path]::GetFileNameWithoutExtension($PromptPath)
+    $initDir = Join-RepoPath $Target ".omp/init"
+    New-Item -ItemType Directory -Force -Path $initDir | Out-Null
+
+    $promptFile = Join-Path $initDir "$promptName-headless-prompt.md"
+    $outputFile = Join-Path $initDir "$promptName-headless-output.md"
+    $stderrFile = Join-Path $initDir "$promptName-headless-stderr.txt"
+    $prompt = New-HeadlessInitPrompt -PromptPath $PromptPath -Target $Target
+    [System.IO.File]::WriteAllText($promptFile, $prompt, [System.Text.UTF8Encoding]::new($false))
+
+    $arguments = @(
+        "-p",
+        "--no-session",
+        "--auto-approve",
+        "--approval-mode",
+        "yolo"
+    )
+    if (-not [string]::IsNullOrWhiteSpace($Model)) {
+        $arguments += @("--model", $Model)
+    }
+    $arguments += "@$promptFile"
+
+    $ompCommand = @(Get-Command -Name "omp" -CommandType Application -ErrorAction Stop)[0]
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $ompCommand.Source
+    $startInfo.WorkingDirectory = $Target
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $startInfo.UseShellExecute = $false
+    foreach ($argument in $arguments) {
+        [void]$startInfo.ArgumentList.Add($argument)
+    }
+
+    $process = [System.Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    [void]$process.Start()
+    $stdout = $process.StandardOutput.ReadToEnd()
+    $stderr = $process.StandardError.ReadToEnd()
+    $process.WaitForExit()
+    $exitCode = $process.ExitCode
+    $process.Dispose()
+
+    [System.IO.File]::WriteAllText($outputFile, $stdout, [System.Text.UTF8Encoding]::new($false))
+    if (-not [string]::IsNullOrEmpty($stderr)) {
+        [System.IO.File]::WriteAllText($stderrFile, $stderr, [System.Text.UTF8Encoding]::new($false))
+    }
+
+    if ($exitCode -ne 0) {
+        [Console]::Out.Write($stdout)
+        [Console]::Error.Write($stderr)
+        Write-Host "Error: Headless init prompt '$promptName' failed with exit code $exitCode." -ForegroundColor Red
+        exit $exitCode
+    }
+
+    Remove-Item -Path $promptFile -Force
+    [Console]::Out.Write($stdout)
+    Write-Host "Headless init prompt '$promptName' completed. Output: .omp/init/$promptName-headless-output.md" -ForegroundColor Cyan
+}
+
 if ($List) {
     Write-Host "Available loadouts:"
     Get-ChildItem -Path $LoadoutsDir -Directory | ForEach-Object { Write-Host "  - $($_.Name)" }
     Write-Host ""
     Write-Host "Harnesses: opencode, codex, gemini, claude (alias: claude-code), omp"
+    exit 0
+}
+
+if ($InitPrompt -and -not $Headless) {
+    Write-Host "Error: -Headless is required when -InitPrompt is used." -ForegroundColor Red
+    exit 1
+}
+
+if ($Headless -and -not $InitPrompt) {
+    Write-Host "Error: -Headless requires -InitPrompt <name>." -ForegroundColor Red
+    exit 1
+}
+
+if ($PlanChanges -and $InitPrompt) {
+    Write-Host "Error: -PlanChanges cannot be used with -InitPrompt." -ForegroundColor Red
+    exit 1
+}
+
+if (-not (Test-Path $Target -PathType Container)) {
+    Write-Host "Error: Target '$Target' is not a directory." -ForegroundColor Red
+    exit 1
+}
+$Target = (Resolve-Path $Target).Path
+
+if ($InitPrompt) {
+    try {
+        $promptPath = Resolve-InitPromptPath -Name $InitPrompt
+        Invoke-OmpHeadlessInitPrompt -Target $Target -PromptPath $promptPath -Model $Model
+    } catch {
+        Write-Host "Error: $($_.Exception.Message)" -ForegroundColor Red
+        exit 1
+    }
     exit 0
 }
 
@@ -752,12 +882,6 @@ if (-not (Test-Path $LoadoutPath)) {
     Write-Host "Error: Loadout '$Loadout' not found." -ForegroundColor Red
     Write-Host "Available loadouts:"
     Get-ChildItem -Path $LoadoutsDir -Directory | ForEach-Object { Write-Host "  - $($_.Name)" }
-    exit 1
-}
-
-$Target = (Resolve-Path $Target).Path
-if (-not (Test-Path $Target -PathType Container)) {
-    Write-Host "Error: Target '$Target' is not a directory." -ForegroundColor Red
     exit 1
 }
 

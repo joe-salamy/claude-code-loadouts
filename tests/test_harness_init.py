@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -35,6 +37,57 @@ class HarnessInitTests(unittest.TestCase):
             text=True,
             check=False,
         )
+
+    def make_fake_omp(
+        self,
+        bin_dir: Path,
+        record_path: Path,
+        *,
+        stdout: str = "completed init\n",
+        stderr: str = "",
+        exit_code: int = 0,
+    ) -> None:
+        bin_dir.mkdir(parents=True, exist_ok=True)
+        fake_omp = bin_dir / "fake_omp.py"
+        fake_omp.write_text(
+            "\n".join(
+                [
+                    "import json",
+                    "import os",
+                    "import sys",
+                    "from pathlib import Path",
+                    "",
+                    f"record_path = Path({str(record_path)!r})",
+                    f"stdout = {stdout!r}",
+                    f"stderr = {stderr!r}",
+                    f"exit_code = {exit_code!r}",
+                    "prompt_arg = next((arg for arg in sys.argv[1:] if arg.startswith('@')), None)",
+                    "if prompt_arg is None:",
+                    "    raise SystemExit('missing @prompt argument')",
+                    "prompt = Path(prompt_arg[1:]).read_text(encoding='utf-8')",
+                    "record_path.write_text(",
+                    "    json.dumps({'argv': sys.argv[1:], 'cwd': os.getcwd(), 'prompt': prompt}),",
+                    "    encoding='utf-8',",
+                    ")",
+                    "sys.stdout.write(stdout)",
+                    "sys.stderr.write(stderr)",
+                    "raise SystemExit(exit_code)",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        if os.name == "nt":
+            (bin_dir / "omp.cmd").write_text(
+                "\n".join(["@echo off", f'"{sys.executable}" "%~dp0fake_omp.py" %*']),
+                encoding="utf-8",
+            )
+        else:
+            omp = bin_dir / "omp"
+            omp.write_text(
+                f'#!/bin/sh\nexec "{sys.executable}" "$(dirname "$0")/fake_omp.py" "$@"\n',
+                encoding="utf-8",
+            )
+            omp.chmod(0o755)
 
     def test_harness_flag_is_required(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -191,6 +244,200 @@ class HarnessInitTests(unittest.TestCase):
             self.assertEqual((target / ".codex" / "skills" / "demo" / "SKILL.md").read_text(encoding="utf-8"), "new skill")
             self.assertIn("[OVERWROTE] Skill 'demo'", result.stdout)
             self.assertNotIn("[EXISTS]   Skill 'demo'", result.stdout)
+
+    def test_headless_init_prompt_invokes_omp_with_augmented_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            script, _ = copy_scripts_to_temp_root(root)
+            prompt_dir = root / "init-prompts"
+            prompt_dir.mkdir()
+            (prompt_dir / "demo.md").write_text("# Demo Prompt\n\nOriginal body.", encoding="utf-8")
+            target = root / "target"
+            target.mkdir()
+            fake_bin = root / "fake-bin"
+            record_path = root / "omp-record.json"
+            self.make_fake_omp(fake_bin, record_path)
+            env = os.environ.copy()
+            env["PATH"] = str(fake_bin) + os.pathsep + env.get("PATH", "")
+
+            result = subprocess.run(
+                ["pwsh", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script), "-Target", str(target), "-InitPrompt", "demo", "-Headless"],
+                cwd=root,
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            record = json.loads(record_path.read_text(encoding="utf-8"))
+            actual_args = list(record["argv"])
+            actual_args[-1] = actual_args[-1].replace("\\", "/")
+            expected_prompt_arg = f"@{target / '.omp' / 'init' / 'demo-headless-prompt.md'}".replace("\\", "/")
+            self.assertEqual(
+                actual_args,
+                ["-p", "--no-session", "--auto-approve", "--approval-mode", "yolo", expected_prompt_arg],
+            )
+            self.assertEqual(Path(record["cwd"]).resolve(), target.resolve())
+            self.assertEqual((target / ".omp" / "init" / "demo-headless-output.md").read_text(encoding="utf-8"), "completed init\n")
+            self.assertFalse((target / ".omp" / "init" / "demo-headless-prompt.md").exists())
+            expected_report_rule = (
+                "Before your final response, create `.omp/init/reports/` in this repository if needed "
+                "and write a timestamped Markdown report there named `yyyyMMdd-HHmmss-init-report.md`."
+            )
+            self.assertIn("Original body.", record["prompt"])
+            self.assertIn("The repository may already satisfy some or all items", record["prompt"])
+            self.assertIn("end-state checklist", record["prompt"])
+            self.assertIn(expected_report_rule, record["prompt"])
+            self.assertNotIn("create .omp/init/reports/", record["prompt"])
+            self.assertNotIn("named yyyyMMdd-HHmmss-init-report.md", record["prompt"])
+            self.assertIn("Headless init prompt 'demo' completed.", result.stdout)
+
+    def test_failed_headless_init_preserves_prompt_and_writes_captured_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            script, _ = copy_scripts_to_temp_root(root)
+            prompt_dir = root / "init-prompts"
+            prompt_dir.mkdir()
+            (prompt_dir / "demo.md").write_text("# Demo Prompt\n\nOriginal body.", encoding="utf-8")
+            target = root / "target"
+            target.mkdir()
+            fake_bin = root / "fake-bin"
+            record_path = root / "omp-record.json"
+            self.make_fake_omp(
+                fake_bin,
+                record_path,
+                stdout="partial init output\n",
+                stderr="diagnostic failure\n",
+                exit_code=17,
+            )
+            env = os.environ.copy()
+            env["PATH"] = str(fake_bin) + os.pathsep + env.get("PATH", "")
+
+            result = subprocess.run(
+                ["pwsh", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script), "-Target", str(target), "-InitPrompt", "demo", "-Headless"],
+                cwd=root,
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            init_dir = target / ".omp" / "init"
+            prompt_file = init_dir / "demo-headless-prompt.md"
+            self.assertEqual(result.returncode, 17, result.stdout + result.stderr)
+            self.assertIn("partial init output", result.stdout)
+            self.assertIn("diagnostic failure", result.stderr)
+            self.assertIn("Error: Headless init prompt 'demo' failed with exit code 17.", result.stdout)
+            self.assertEqual((init_dir / "demo-headless-output.md").read_text(encoding="utf-8"), "partial init output\n")
+            self.assertEqual((init_dir / "demo-headless-stderr.txt").read_text(encoding="utf-8"), "diagnostic failure\n")
+            self.assertTrue(prompt_file.exists())
+            preserved_prompt = prompt_file.read_text(encoding="utf-8")
+            self.assertIn("Original body.", preserved_prompt)
+            self.assertIn("`yyyyMMdd-HHmmss-init-report.md`", preserved_prompt)
+
+    def test_headless_init_prompt_accepts_model_option(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            script, _ = copy_scripts_to_temp_root(root)
+            prompt_dir = root / "init-prompts"
+            prompt_dir.mkdir()
+            (prompt_dir / "demo.md").write_text("# Demo Prompt\n\nOriginal body.", encoding="utf-8")
+            target = root / "target"
+            target.mkdir()
+            fake_bin = root / "fake-bin"
+            record_path = root / "omp-record.json"
+            self.make_fake_omp(fake_bin, record_path)
+            env = os.environ.copy()
+            env["PATH"] = str(fake_bin) + os.pathsep + env.get("PATH", "")
+
+            result = subprocess.run(
+                [
+                    "pwsh",
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(script),
+                    "-Target",
+                    str(target),
+                    "-InitPrompt",
+                    "demo",
+                    "-Headless",
+                    "-Model",
+                    "gpt-test",
+                ],
+                cwd=root,
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            record = json.loads(record_path.read_text(encoding="utf-8"))
+            self.assertEqual(record["argv"][-3:-1], ["--model", "gpt-test"])
+            self.assertTrue(record["argv"][-1].replace("\\", "/").endswith("/target/.omp/init/demo-headless-prompt.md"))
+
+    def test_headless_init_prompt_requires_headless_switch(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            script, _ = copy_scripts_to_temp_root(root)
+            prompt_dir = root / "init-prompts"
+            prompt_dir.mkdir()
+            (prompt_dir / "demo.md").write_text("# Demo Prompt\n", encoding="utf-8")
+            target = root / "target"
+            target.mkdir()
+
+            result = subprocess.run(
+                ["pwsh", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script), "-Target", str(target), "-InitPrompt", "demo"],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("-Headless is required when -InitPrompt is used", result.stdout)
+
+    def test_headless_switch_requires_init_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            script, _ = copy_scripts_to_temp_root(root)
+            target = root / "target"
+            target.mkdir()
+
+            result = subprocess.run(
+                ["pwsh", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script), "-Target", str(target), "-Headless"],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("-Headless requires -InitPrompt <name>", result.stdout)
+
+    def test_headless_init_prompt_rejects_path_traversal(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            script, _ = copy_scripts_to_temp_root(root)
+            prompt_dir = root / "init-prompts"
+            prompt_dir.mkdir()
+            (prompt_dir / "demo.md").write_text("# Demo Prompt\n", encoding="utf-8")
+            target = root / "target"
+            target.mkdir()
+
+            result = subprocess.run(
+                ["pwsh", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script), "-Target", str(target), "-InitPrompt", "../demo", "-Headless"],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Init prompt name must be a file name under init-prompts", result.stdout)
 
     def test_update_loadout_repos_updates_recorded_repos_and_skips_missing(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

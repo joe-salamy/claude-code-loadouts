@@ -27,7 +27,15 @@ mkdir loadouts/my-loadout
 
 ## Init Prompts
 
-Reusable repo-initialization prompts live in `init-prompts/`. They are source templates, not loadout payloads, so `harness-init.ps1` does not copy them into target repos. Use them when a target repo needs discovery-driven setup before or after applying a loadout.
+Reusable repo-initialization prompts live in `init-prompts/`. They are source templates, not loadout payloads, so loadout application does not copy them into target repos. Use them when a target repo needs discovery-driven setup before or after applying a loadout.
+
+Run an init prompt headlessly with OMP:
+
+```powershell
+.\harness-init.ps1 -Target C:\path\to\repo -InitPrompt omp-repo-init -Headless
+```
+
+Headless init is hard-coded to OMP. It writes run artifacts under the target repo's `.omp/init/`, and the runtime prompt instructions require the follow-up report under `.omp/init/reports/`.
 
 ## Harness Conventions
 
