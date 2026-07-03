@@ -23,20 +23,22 @@ Create or update `README.md` so a new contributor can run the project without re
 
 Remove stale or duplicated README content. Do not add marketing copy.
 
-## 3. Curate 5-10 repo-specific OMP skills
+## 3. Create new repo-specific OMP skills
 
-Use `web_search` and official sources based on this repo's actual stack to choose 5-10 high-leverage skills. Prefer official framework/database/cloud/security/testing docs and source-backed guidance over blog posts. The final skill set should cover the repo's real work, not generic categories.
+Use `web_search` and official sources based on this repo's actual stack to choose high-leverage skills. Prefer official framework/database/cloud/security/testing docs and source-backed guidance over blog posts. New skills should cover the repo's real work, not generic categories.
 
-For each selected skill:
+Do not update, overwrite, delete, rename, or rewrite existing `.omp/skills/*/SKILL.md` files. Existing skills are user-owned state. If existing skills are stale, generic, overlapping, or incomplete, leave them unchanged and mention the issue in the final response. Add only new skill directories/files for missing repo-specific coverage.
+
+For each new skill:
 
 - create `.omp/skills/<skill-name>/SKILL.md` using one directory per skill;
 - include frontmatter with exact `name` and a specific `description` that explains when to use it;
 - write concise workflow guidance tailored to this repository;
 - include commands, files, invariants, and verification checks only when they are confirmed for this repo;
 - keep supporting references under the same skill directory when needed, so `skill://<skill-name>/...` works;
-- avoid duplicate or overlapping skills; merge overlaps into the sharper skill.
+- avoid duplicate or overlapping new skills; merge overlaps into the sharper new skill.
 
-Good default coverage to consider, only when the repo justifies it: primary framework, language/runtime, database/storage, auth/security, test strategy, deployment/ops, UI/design system, performance, code review, release/publish readiness.
+Good default coverage to consider, only when the repo justifies a new skill: primary framework, language/runtime, database/storage, auth/security, test strategy, deployment/ops, UI/design system, performance, code review, release/publish readiness.
 
 ## 4. Add repo instructions for OMP skills
 
