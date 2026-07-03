@@ -1,0 +1,14 @@
+{
+  "audit_head_before": "b10222ab4472d10e57f877e32b3d2e1e93f3a52c",
+  "base": "main",
+  "completed_stage": "cleanup_complete",
+  "feature_branch": "feature/headless-init-prompts",
+  "feature_worktree": "C:\\Users\\joesa\\Code\\harness-loadouts-headless-init-prompts",
+  "integration_branch": "integration/headless-init-prompts-20260703-105624",
+  "integration_worktree": "C:\\Users\\joesa\\Code\\harness-loadouts-integrate-headless-init-prompts-20260703-105624",
+  "merge_mode": "squash",
+  "plan_path": "C:\\Users\\joesa\\Code\\harness-loadouts-headless-init-prompts\\.omp\\worktree-flow\\20260703-104422-headless-init-prompts\\plan.md",
+  "plan_title": "Headless Init Prompts",
+  "run_id": "20260703-104422-headless-init-prompts",
+  "slug": "headless-init-prompts"
+}
