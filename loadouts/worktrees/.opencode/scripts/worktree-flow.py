@@ -296,6 +296,12 @@ def write_text(path: Path, text: str) -> None:
 
 
 @dataclass(frozen=True)
+class GitWorktree:
+    path: Path
+    branch: str | None
+
+
+@dataclass(frozen=True)
 class Names:
     slug: str
     branch: str
@@ -457,6 +463,15 @@ class HarnessWorktreeFlow:
     def workflow_state_file(self, worktree: Path) -> Path:
         return worktree / self.handoff_dir / WORKFLOW_STATE_FILENAME
 
+    def read_workflow_state_file(self, path: Path) -> WorkflowState | None:
+        if not path.exists():
+            return None
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return WorkflowState(**data)
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise FlowError(f"Invalid workflow state file: {path}") from exc
+
     def save_workflow_state_file(self, path: Path, state: WorkflowState) -> None:
         self.ensure_dir(path.parent)
         self._last_state = state
@@ -471,16 +486,9 @@ class HarnessWorktreeFlow:
         self.save_workflow_state_file(self.workflow_state_file(target_worktree), state)
 
     def load_workflow_state(self, worktree: Path) -> WorkflowState | None:
-        path = self.workflow_state_file(worktree)
-        if not path.exists():
-            return None
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            state = WorkflowState(**data)
-            self._last_state = state
-            return state
-        except (json.JSONDecodeError, TypeError) as exc:
-            raise FlowError(f"Invalid workflow state file: {path}") from exc
+        state = self.read_workflow_state_file(self.workflow_state_file(worktree))
+        self._last_state = state
+        return state
 
     def resume_command_args(self) -> list[str] | None:
         state = self._last_state
@@ -589,6 +597,80 @@ class HarnessWorktreeFlow:
         result = self.runner.run(["git", "rev-parse", "--show-toplevel"], start)
         root = result.stdout.strip()
         return Path(root).resolve() if root else start
+
+    def git_worktrees(self, repo: Path) -> list[GitWorktree]:
+        result = self.runner.run(["git", "worktree", "list", "--porcelain"], repo)
+        entries: list[GitWorktree] = []
+        path: Path | None = None
+        branch: str | None = None
+
+        def add_entry() -> None:
+            nonlocal path, branch
+            if path is not None:
+                entries.append(GitWorktree(path.resolve(), branch))
+            path = None
+            branch = None
+
+        for line in result.stdout.splitlines():
+            if not line:
+                add_entry()
+                continue
+            key, _, value = line.partition(" ")
+            if key == "worktree":
+                add_entry()
+                path = Path(value).expanduser()
+            elif key == "branch":
+                branch = value.removeprefix("refs/heads/")
+        add_entry()
+        return entries
+
+    def matching_resume_worktrees(
+        self, worktrees: Sequence[GitWorktree], run_id: str
+    ) -> list[Path]:
+        matches: list[Path] = []
+        for worktree in worktrees:
+            state = self.read_workflow_state_file(
+                self.workflow_state_file(worktree.path)
+            )
+            if state is not None and state.run_id == run_id:
+                matches.append(worktree.path)
+        return matches
+
+    def infer_resume_worktree(self, repo: Path, plan: Path) -> Path:
+        worktrees = self.git_worktrees(repo)
+        run_id = self.run_id_from_plan(repo, plan)
+        if run_id is not None:
+            matches = self.matching_resume_worktrees(worktrees, run_id)
+            if len(matches) == 1:
+                return matches[0]
+            if len(matches) > 1:
+                raise FlowError(
+                    f"Multiple worktrees have workflow state for run id {run_id}; "
+                    "pass --worktree explicitly."
+                )
+
+        slug = derive_slug(plan)
+        expected = (repo.parent / f"{repo.name}-{slug}").resolve()
+        expected_matches = [
+            worktree.path for worktree in worktrees if worktree.path == expected
+        ]
+        if len(expected_matches) == 1:
+            return expected_matches[0]
+
+        branch = f"feature/{slug}"
+        branch_matches = [
+            worktree.path for worktree in worktrees if worktree.branch == branch
+        ]
+        if len(branch_matches) == 1:
+            return branch_matches[0]
+        if len(branch_matches) > 1:
+            raise FlowError(
+                f"Multiple worktrees use branch {branch}; pass --worktree explicitly."
+            )
+
+        raise FlowError(
+            "Could not infer the feature worktree for --resume; pass --worktree."
+        )
 
     def unique_feature_names(
         self, repo: Path, slug: str, run_id: str | None = None
@@ -2128,7 +2210,10 @@ def build_parser(
     )
     parser.add_argument(
         "--worktree",
-        help="Existing feature worktree to resume; required with --resume.",
+        help=(
+            "Existing feature worktree to resume. Defaults to the saved plan's "
+            "existing worktree with --resume."
+        ),
     )
     parser.add_argument(
         "--branch", help="Feature branch for --resume. Defaults to the worktree branch."
@@ -2233,8 +2318,9 @@ def main(
         default_harness_dir=default_harness_dir,
     )
     args = parser.parse_args(argv)
-    if args.resume and not args.worktree:
-        parser.error("--worktree is required with --resume")
+    resume_worktree_arg = (
+        Path(args.worktree).expanduser().resolve() if args.worktree else None
+    )
     resume_only_args = resume_only_values(args)
     if not args.resume and any(value is not None for value in resume_only_args):
         parser.error("resume-only arguments require --resume")
@@ -2254,10 +2340,11 @@ def main(
             repo = flow.git_root(config.repo.resolve())
             plan = config.plan.resolve()
             flow.validate(repo, plan)
+            worktree = resume_worktree_arg or flow.infer_resume_worktree(repo, plan)
             flow.resume(
                 repo=repo,
                 plan=plan,
-                worktree=Path(args.worktree).expanduser().resolve(),
+                worktree=worktree,
                 branch=args.branch,
                 run_id=args.run_id,
                 integration_worktree=integration_worktree_arg(

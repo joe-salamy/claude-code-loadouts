@@ -1751,6 +1751,125 @@ class HarnessWorktreeFlowTests(unittest.TestCase):
         self.assertEqual(created["config"].command_timeout_seconds, 3.5)
         self.assertEqual(created["runner"].command_timeout_seconds, 3.5)
 
+    def test_main_resume_without_worktree_infers_matching_state_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            repo = Path(temp) / "repo"
+            run_id = "20260629-082455-plan"
+            plan = repo / ".codex" / "worktree-flow" / run_id / "plan.md"
+            decoy = Path(temp) / "repo-a-decoy"
+            feature = Path(temp) / "repo-z-feature"
+            repo.mkdir()
+            plan.parent.mkdir(parents=True)
+            plan.write_text("# Plan", encoding="utf-8")
+
+            subject = flow.HarnessWorktreeFlow(self.config(repo, plan), FakeRunner())
+            for worktree, state_run_id in ((decoy, "different-run"), (feature, run_id)):
+                worktree_plan = (
+                    worktree / ".codex" / "worktree-flow" / state_run_id / "plan.md"
+                )
+                worktree_plan.parent.mkdir(parents=True)
+                worktree_plan.write_text("# Plan", encoding="utf-8")
+                state = flow.replace(
+                    self.workflow_state(worktree),
+                    run_id=state_run_id,
+                    feature_worktree=str(worktree),
+                    plan_path=str(worktree_plan),
+                )
+                subject.save_workflow_state(state, worktree=worktree)
+
+            resumed = {}
+
+            class FakeCommandRunner(FakeRunner):
+                def __init__(
+                    self,
+                    dry_run: bool = False,
+                    *,
+                    verbose: bool = False,
+                    command_timeout_seconds: float | None = None,
+                ) -> None:
+                    worktree_list = (
+                        f"worktree {repo}\n\n"
+                        f"worktree {decoy}\n\n"
+                        f"worktree {feature}\n\n"
+                    )
+                    super().__init__(
+                        {("git", "worktree", "list", "--porcelain"): worktree_list},
+                        dry_run=dry_run,
+                    )
+
+            def fake_resume(self, **kwargs) -> None:
+                resumed.update(kwargs)
+
+            with (
+                mock.patch.object(flow, "CommandRunner", FakeCommandRunner),
+                mock.patch.object(flow.HarnessWorktreeFlow, "git_root", return_value=repo),
+                mock.patch.object(flow.HarnessWorktreeFlow, "validate", return_value=None),
+                mock.patch.object(flow.HarnessWorktreeFlow, "resume", fake_resume),
+            ):
+                result = flow.main(
+                    [
+                        "--resume",
+                        "--plan",
+                        str(plan),
+                        "--repo",
+                        str(repo),
+                        "--harness-dir",
+                        ".codex",
+                    ]
+                )
+
+            self.assertEqual(result, 0)
+            self.assertEqual(resumed["worktree"], feature.resolve())
+
+    def test_main_resume_explicit_worktree_overrides_state_inference(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            repo = Path(temp) / "repo"
+            run_id = "20260629-082455-plan"
+            plan = repo / ".codex" / "worktree-flow" / run_id / "plan.md"
+            inferred = Path(temp) / "repo-inferred"
+            explicit = Path(temp) / "manual feature"
+            repo.mkdir()
+            explicit.mkdir()
+            plan.parent.mkdir(parents=True)
+            plan.write_text("# Plan", encoding="utf-8")
+
+            subject = flow.HarnessWorktreeFlow(self.config(repo, plan), FakeRunner())
+            state = flow.replace(
+                self.workflow_state(inferred),
+                run_id=run_id,
+                feature_worktree=str(inferred),
+                plan_path=str(
+                    inferred / ".codex" / "worktree-flow" / run_id / "plan.md"
+                ),
+            )
+            subject.save_workflow_state(state, worktree=inferred)
+            resumed = {}
+
+            def fake_resume(self, **kwargs) -> None:
+                resumed.update(kwargs)
+
+            with (
+                mock.patch.object(flow.HarnessWorktreeFlow, "git_root", return_value=repo),
+                mock.patch.object(flow.HarnessWorktreeFlow, "validate", return_value=None),
+                mock.patch.object(flow.HarnessWorktreeFlow, "resume", fake_resume),
+            ):
+                result = flow.main(
+                    [
+                        "--resume",
+                        "--plan",
+                        str(plan),
+                        "--repo",
+                        str(repo),
+                        "--worktree",
+                        str(explicit),
+                        "--harness-dir",
+                        ".codex",
+                    ]
+                )
+
+            self.assertEqual(result, 0)
+            self.assertEqual(resumed["worktree"], explicit.resolve())
+
     def test_resume_command_args_uses_saved_workflow_state(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             repo = Path(temp) / "repo"
