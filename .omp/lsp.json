@@ -5,6 +5,21 @@
       "args": ["--stdio"],
       "fileTypes": [".py"],
       "rootMarkers": [".omp"]
+    },
+    "typescript-language-server": {
+      "disabled": true
+    },
+    "vscode-html-language-server": {
+      "disabled": true
+    },
+    "vscode-css-language-server": {
+      "disabled": true
+    },
+    "vscode-json-language-server": {
+      "disabled": true
+    },
+    "eslint": {
+      "disabled": true
     }
   }
 }
