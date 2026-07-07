@@ -2,6 +2,8 @@
 
 Initialize this repository for effective OMP coding-agent work. Work directly in the current repository. Optimize for correctness, maintainability, and minimal durable configuration. Do not create mocks, stubs, placeholder skills, or speculative settings. Do not store secrets in committed files.
 
+Do not create, update, rewrite, delete, or otherwise touch `AGENTS.md`. Treat it as user-owned instruction state.
+
 ## 1. Discover before editing
 
 - Read existing repo instructions, README files, package manifests, build/test config, harness config, and the main source tree before changing files.
@@ -40,16 +42,9 @@ For each new skill:
 
 Good default coverage to consider, only when the repo justifies a new skill: primary framework, language/runtime, database/storage, auth/security, test strategy, deployment/ops, UI/design system, performance, code review, release/publish readiness.
 
-## 4. Add repo instructions for OMP skills
+## 4. Leave repo instruction files untouched
 
-Ensure the repo instruction file (`AGENTS.md` when present, otherwise create it) contains concise OMP guidance:
-
-- read `skill://<skill-name>` before following a skill;
-- prefer repo-local commands from the README or package manifests;
-- never commit secrets or generated cache artifacts.
-- periodically use `skill://optimize-repo-skills` when the repo's skill set needs review, pruning, or expansion.
-
-If a different instruction file already owns this policy, update that file instead of duplicating it.
+Do not edit repo instruction files as part of initialization. In particular, never create, update, rewrite, delete, or otherwise touch `AGENTS.md`. If OMP-specific guidance is missing from existing instruction files, mention that in the final response instead of changing those files.
 
 ## 5. Set up OMP LSP support
 

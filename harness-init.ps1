@@ -791,24 +791,34 @@ function Invoke-OmpHeadlessInitPrompt {
     $arguments += "@$promptFile"
 
     $ompCommand = @(Get-Command -Name "omp" -CommandType Application -ErrorAction Stop)[0]
-    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
-    $startInfo.FileName = $ompCommand.Source
-    $startInfo.WorkingDirectory = $Target
-    $startInfo.RedirectStandardOutput = $true
-    $startInfo.RedirectStandardError = $true
-    $startInfo.UseShellExecute = $false
-    foreach ($argument in $arguments) {
-        [void]$startInfo.ArgumentList.Add($argument)
+    $outputLines = [System.Collections.Generic.List[string]]::new()
+    $stderrLines = [System.Collections.Generic.List[string]]::new()
+
+    Write-Host "Running headless init prompt '$promptName'. Streaming OMP output below..." -ForegroundColor Cyan
+    $previousErrorActionPreference = $ErrorActionPreference
+    Push-Location -LiteralPath $Target
+    try {
+        $ErrorActionPreference = "Continue"
+        & $ompCommand.Source @arguments 2>&1 | ForEach-Object {
+            $isError = $_ -is [System.Management.Automation.ErrorRecord]
+            $text = if ($isError) { $_.ToString() } else { [string]$_ }
+
+            if ($isError) {
+                [Console]::Error.WriteLine($text)
+                [void]$stderrLines.Add($text)
+            } else {
+                [Console]::Out.WriteLine($text)
+            }
+            [void]$outputLines.Add($text)
+        }
+        $exitCode = if ($null -ne $LASTEXITCODE) { $LASTEXITCODE } else { 0 }
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+        Pop-Location
     }
 
-    $process = [System.Diagnostics.Process]::new()
-    $process.StartInfo = $startInfo
-    [void]$process.Start()
-    $stdout = $process.StandardOutput.ReadToEnd()
-    $stderr = $process.StandardError.ReadToEnd()
-    $process.WaitForExit()
-    $exitCode = $process.ExitCode
-    $process.Dispose()
+    $stdout = if ($outputLines.Count -gt 0) { [string]::Join([Environment]::NewLine, $outputLines) + [Environment]::NewLine } else { "" }
+    $stderr = if ($stderrLines.Count -gt 0) { [string]::Join([Environment]::NewLine, $stderrLines) + [Environment]::NewLine } else { "" }
 
     [System.IO.File]::WriteAllText($outputFile, $stdout, [System.Text.UTF8Encoding]::new($false))
     if (-not [string]::IsNullOrEmpty($stderr)) {
@@ -816,14 +826,11 @@ function Invoke-OmpHeadlessInitPrompt {
     }
 
     if ($exitCode -ne 0) {
-        [Console]::Out.Write($stdout)
-        [Console]::Error.Write($stderr)
         Write-Host "Error: Headless init prompt '$promptName' failed with exit code $exitCode." -ForegroundColor Red
         exit $exitCode
     }
 
     Remove-Item -Path $promptFile -Force
-    [Console]::Out.Write($stdout)
     Write-Host "Headless init prompt '$promptName' completed. Output: .omp/init/$promptName-headless-output.md" -ForegroundColor Cyan
 }
 
