@@ -131,7 +131,7 @@ class FailingHarnessExecRunner(FakeRunner):
 
     def run(self, args, cwd, *, check=True, capture=True, input_text=None):
         key = tuple(args)
-        if key[:2] == ("codex", "exec"):
+        if key[:2] in {("codex", "exec"), ("omp", "-p")}:
             self.calls.append((key, Path(cwd), check))
             self.inputs.append(input_text)
             return flow.CommandResult(
@@ -364,8 +364,9 @@ class SharedHarnessSelectionTests(unittest.TestCase):
                 keep_worktrees=False,
             )
             subject = flow.HarnessWorktreeFlow(config, runner)
+            subject.omp_sessions_roots = lambda _repo: []
 
-            subject.harness_exec(repo, "Prompt", output_file)
+            subject.harness_exec(repo, "Prompt", output_file, phase="implementation")
 
             self.assertEqual(runner.calls[-1][0], args)
             self.assertIsNone(runner.inputs[-1])
@@ -613,6 +614,32 @@ class HarnessWorktreeFlowTests(unittest.TestCase):
             self.assertEqual(archive, repo / ".codex" / "worktree-flow" / "plan-run")
             self.assertFalse(archive.exists())
 
+    def test_archive_handoff_copies_usage_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            repo = Path(temp) / "repo"
+            worktree = Path(temp) / "repo-feature"
+            handoff = worktree / ".codex" / "handoff"
+            repo.mkdir()
+            handoff.mkdir(parents=True)
+            artifacts = {
+                "usage-events.jsonl": '{"phase":"implementation"}\n',
+                "usage-summary.json": '{"schema_version":1}\n',
+                "usage-sources.json": '[{"source_id":"session-1"}]\n',
+            }
+            for name, content in artifacts.items():
+                (handoff / name).write_text(content, encoding="utf-8")
+
+            archive = flow.HarnessWorktreeFlow(
+                self.config(repo, repo / "plan.md"), FakeRunner()
+            ).archive_handoff(repo, worktree, "plan-run")
+
+            self.assertEqual(archive, repo / ".codex" / "worktree-flow" / "plan-run")
+            for name, content in artifacts.items():
+                self.assertEqual(
+                    (archive / name).read_text(encoding="utf-8"),
+                    content,
+                )
+
     def test_prepare_harness_permissions_grants_sandbox_group_on_windows(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             harness_dir = Path(temp) / ".codex"
@@ -697,11 +724,13 @@ class HarnessWorktreeFlowTests(unittest.TestCase):
                 }
             )
             subject = flow.HarnessWorktreeFlow(self.config(repo, repo / "plan.md"), runner)
+            subject.omp_sessions_roots = lambda _repo: []
 
             subject.harness_exec(
                 worktree,
                 "Prompt",
                 worktree / ".codex" / "handoff" / "implementation-final-response.md",
+                phase="implementation",
             )
 
             args = runner.calls[-1][0]
@@ -721,9 +750,10 @@ class HarnessWorktreeFlowTests(unittest.TestCase):
             repo.mkdir()
             runner = FakeRunner()
             subject = flow.HarnessWorktreeFlow(self.config(repo, repo / "plan.md"), runner)
+            subject.omp_sessions_roots = lambda _repo: []
 
             with mock.patch.object(flow.os, "name", "nt"):
-                subject.harness_exec(repo, "Prompt", repo / "out.md")
+                subject.harness_exec(repo, "Prompt", repo / "out.md", phase="implementation")
 
             args = runner.calls[-1][0]
             sandbox_index = args.index("--sandbox")
@@ -735,9 +765,10 @@ class HarnessWorktreeFlowTests(unittest.TestCase):
             repo.mkdir()
             runner = FakeRunner()
             subject = flow.HarnessWorktreeFlow(self.config(repo, repo / "plan.md"), runner)
+            subject.omp_sessions_roots = lambda _repo: []
 
             with mock.patch.object(flow.os, "name", "posix"):
-                subject.harness_exec(repo, "Prompt", repo / "out.md")
+                subject.harness_exec(repo, "Prompt", repo / "out.md", phase="implementation")
 
             args = runner.calls[-1][0]
             sandbox_index = args.index("--sandbox")
@@ -1207,7 +1238,9 @@ class HarnessWorktreeFlowTests(unittest.TestCase):
             plan = repo / "plan.md"
             config = self.config(repo, plan, model="gpt-5")
             runner = FakeRunner()
-            flow.HarnessWorktreeFlow(config, runner).harness_exec(repo, "Prompt", repo / "out.md")
+            subject = flow.HarnessWorktreeFlow(config, runner)
+            subject.omp_sessions_roots = lambda _repo: []
+            subject.harness_exec(repo, "Prompt", repo / "out.md", phase="implementation")
             args = runner.calls[-1][0]
             self.assertEqual(args[:2], ("codex", "exec"))
             self.assertIn("--model", args)
@@ -1224,9 +1257,10 @@ class HarnessWorktreeFlowTests(unittest.TestCase):
             worktree.mkdir()
             output_file = worktree / ".codex" / "handoff" / "implementation-final-response.md"
             subject = flow.HarnessWorktreeFlow(self.config(repo, repo / "plan.md"), FakeRunner())
+            subject.omp_sessions_roots = lambda _repo: []
 
             subject.start_log(repo, "plan-run")
-            subject.harness_exec(worktree, "Secret prompt", output_file)
+            subject.harness_exec(worktree, "Secret prompt", output_file, phase="implementation")
 
             log_file = repo / ".codex" / "handoff" / "workflow.jsonl"
             records = [
@@ -1269,10 +1303,11 @@ class HarnessWorktreeFlowTests(unittest.TestCase):
             stdout = "x" * (flow.MAX_LOG_OUTPUT_CHARS + 5)
             runner = FailingHarnessExecRunner(stdout=stdout, stderr="failed")
             subject = flow.HarnessWorktreeFlow(self.config(repo, repo / "plan.md"), runner)
+            subject.omp_sessions_roots = lambda _repo: []
 
             subject.start_log(repo, "plan-run")
             with self.assertRaisesRegex(flow.FlowError, "exit code 42"):
-                subject.harness_exec(worktree, "Secret prompt", output_file)
+                subject.harness_exec(worktree, "Secret prompt", output_file, phase="implementation")
 
             log_file = repo / ".codex" / "handoff" / "workflow.jsonl"
             records = [
@@ -1316,10 +1351,11 @@ class HarnessWorktreeFlowTests(unittest.TestCase):
                 timed_out=True,
             )
             subject = flow.HarnessWorktreeFlow(self.config(repo, repo / "plan.md"), runner)
+            subject.omp_sessions_roots = lambda _repo: []
 
             subject.start_log(repo, "plan-run")
             with self.assertRaisesRegex(flow.FlowError, "Command timed out"):
-                subject.harness_exec(worktree, "Secret prompt", output_file)
+                subject.harness_exec(worktree, "Secret prompt", output_file, phase="implementation")
 
             log_file = repo / ".codex" / "handoff" / "workflow.jsonl"
             records = [
@@ -1332,6 +1368,378 @@ class HarnessWorktreeFlowTests(unittest.TestCase):
             self.assertEqual(failure["returncode"], -9)
             self.assertEqual(failure["stdout"]["text"], "partial")
             self.assertNotIn("Secret prompt", json.dumps(records, ensure_ascii=False))
+
+    def test_collects_omp_usage_stats_split_by_phase_without_text(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            repo = Path(temp) / "repo"
+            worktree = Path(temp) / "repo-feature"
+            sessions_root = Path(temp) / "sessions"
+            repo.mkdir()
+            worktree.mkdir()
+            sessions_root.mkdir()
+            subject = flow.HarnessWorktreeFlow(
+                self.omp_config(repo, repo / "plan.md"), FakeRunner()
+            )
+            subject.omp_sessions_roots = lambda _repo: [sessions_root]
+            impl_session = sessions_root / "implementation.jsonl"
+            audit_session = sessions_root / "audit.jsonl"
+            secret_path = worktree / "secret-input.txt"
+            prompt_text = "PROMPT_TEXT_SHOULD_NOT_LEAK"
+            display_text = "DISPLAY_TEXT_SHOULD_NOT_LEAK"
+            answer_text = "ANSWER_TEXT_SHOULD_NOT_LEAK"
+
+            impl_snapshot = subject.snapshot_omp_sessions(repo)
+            self.write_jsonl_file(
+                impl_session,
+                [
+                    {"type": "session", "sessionId": "impl-session", "cwd": str(worktree)},
+                    {"type": "model_change", "model_change": {"model": "gpt-5.5"}},
+                    {
+                        "id": "impl-assistant",
+                        "type": "message",
+                        "message": {
+                            "role": "assistant",
+                            "api": "responses",
+                            "provider": "openai-codex",
+                            "model": "gpt-5.5",
+                            "stopReason": "stop",
+                            "content": prompt_text,
+                            "usage": {
+                                "input": 10,
+                                "output": 4,
+                                "cacheRead": 3,
+                                "cacheWrite": 2,
+                                "reasoningTokens": 1,
+                                "totalTokens": 20,
+                                "cost": {
+                                    "input": 0.01,
+                                    "output": 0.02,
+                                    "cacheRead": 0.03,
+                                    "cacheWrite": 0.04,
+                                    "total": 0.12,
+                                },
+                            },
+                            "duration": 1.5,
+                            "ttft": 0.2,
+                            "contextSnapshot": {
+                                "promptTokens": 100,
+                                "nonMessageTokens": 25,
+                            },
+                            "details": {
+                                "displayContent": display_text,
+                                "response": {
+                                    "answer": answer_text,
+                                    "usage": {
+                                        "inputTokens": 7,
+                                        "outputTokens": 8,
+                                        "totalTokens": 15,
+                                    },
+                                },
+                                "files": [str(secret_path)],
+                                "url": "https://example.invalid/secret-response",
+                            },
+                        },
+                    },
+                ],
+            )
+            impl_event = subject.collect_phase_usage(
+                repo,
+                worktree,
+                "implementation",
+                impl_snapshot,
+                flow.CommandResult(
+                    ("omp", "-p"),
+                    worktree,
+                    0,
+                    started_at="impl-start",
+                    finished_at="impl-finish",
+                    duration_ms=1500,
+                ),
+            )
+            subject.append_usage_event(worktree, impl_event)
+            subject.rewrite_usage_summary(worktree)
+            subject.rewrite_usage_sources(worktree)
+
+            audit_snapshot = subject.snapshot_omp_sessions(repo)
+            self.write_jsonl_file(
+                audit_session,
+                [
+                    {"type": "session", "sessionId": "audit-session", "cwd": str(worktree)},
+                    {
+                        "id": "audit-assistant",
+                        "type": "message",
+                        "message": {
+                            "role": "assistant",
+                            "provider": "openai-codex",
+                            "model": "gpt-5.5",
+                            "usage": {
+                                "input": 2,
+                                "output": 3,
+                                "totalTokens": 5,
+                            },
+                            "details": {"displayContent": display_text},
+                        },
+                    },
+                    {
+                        "id": "audit-read-start",
+                        "type": "custom",
+                        "customType": "tool_execution_start",
+                        "data": {
+                            "toolName": "read",
+                            "args": {"path": str(secret_path)},
+                        },
+                    },
+                    {
+                        "id": "audit-read-result",
+                        "type": "message",
+                        "message": {
+                            "role": "toolResult",
+                            "toolName": "read",
+                            "isError": False,
+                            "details": {
+                                "wallTimeMs": 12,
+                                "fileCount": 2,
+                                "matchCount": 4,
+                                "fileLimitReached": True,
+                                "resultLimitReached": True,
+                                "displayContent": display_text,
+                                "stdout": "STDOUT_SHOULD_NOT_LEAK",
+                                "stderr": "STDERR_SHOULD_NOT_LEAK",
+                                "url": "https://example.invalid/tool-result",
+                            },
+                        },
+                    },
+                ],
+            )
+            audit_event = subject.collect_phase_usage(
+                repo,
+                worktree,
+                "audit",
+                audit_snapshot,
+                flow.CommandResult(
+                    ("omp", "-p"),
+                    worktree,
+                    0,
+                    started_at="audit-start",
+                    finished_at="audit-finish",
+                    duration_ms=2500,
+                ),
+            )
+            subject.append_usage_event(worktree, audit_event)
+            subject.rewrite_usage_summary(worktree)
+            subject.rewrite_usage_sources(worktree)
+
+            handoff = worktree / ".omp" / "handoff"
+            events = self.read_jsonl_file(handoff / "usage-events.jsonl")
+            summary = self.read_json_file(handoff / "usage-summary.json")
+            sources_payload = self.read_json_file(handoff / "usage-sources.json")
+            sources = sources_payload["sources"]
+            self.assertEqual([event["phase"] for event in events], ["implementation", "audit"])
+            self.assertEqual(events[0]["status"], "collected")
+            self.assertEqual(events[0]["command_returncode"], 0)
+            self.assertFalse(events[0]["command_timed_out"])
+            self.assertEqual(events[0]["command_duration_ms"], 1500)
+            self.assertEqual(events[0]["nested_response_usage"]["total_tokens"], 15)
+            self.assertEqual(events[0]["context"]["max_prompt_tokens"], 100)
+            self.assertEqual(events[0]["context"]["last_non_message_tokens"], 25)
+            self.assertEqual(events[1]["event_counts"]["tool_execution_start"], 1)
+            self.assertEqual(events[1]["tools"]["read"]["results"], 1)
+            self.assertEqual(events[1]["tools"]["read"]["wall_time_ms"], 12)
+            self.assertEqual(events[1]["tools"]["read"]["file_count"], 2)
+            self.assertEqual(events[1]["tools"]["read"]["match_count"], 4)
+            self.assertEqual(events[1]["tools"]["read"]["file_limit_reached"], 1)
+            self.assertEqual(events[1]["tools"]["read"]["result_limit_reached"], 1)
+            self.assertEqual(summary["schema_version"], 1)
+            self.assertEqual(summary["phases"]["implementation"]["runs"], 1)
+            self.assertEqual(
+                summary["phases"]["implementation"]["status_counts"]["collected"],
+                1,
+            )
+            self.assertEqual(
+                summary["phases"]["implementation"]["totals"]["total_tokens"],
+                20,
+            )
+            self.assertEqual(summary["phases"]["implementation"]["totals"]["input_tokens"], 10)
+            self.assertEqual(summary["phases"]["implementation"]["totals"]["cost_total"], 0.12)
+            self.assertEqual(summary["phases"]["audit"]["totals"]["total_tokens"], 5)
+            self.assertEqual(summary["phases"]["audit"]["tools"]["read"]["calls"], 1)
+            self.assertEqual(summary["phases"]["audit"]["tools"]["read"]["results"], 1)
+            self.assertEqual(summary["phases"]["audit"]["tools"]["read"]["wall_time_ms"], 12)
+            self.assertEqual(summary["phases"]["audit"]["tools"]["read"]["file_count"], 2)
+            self.assertEqual(summary["totals"]["total_tokens"], 25)
+            self.assertEqual(summary["tools"]["read"]["calls"], 1)
+            self.assertEqual(summary["sources"]["count"], 2)
+            self.assertEqual(len(summary["sources"]["path_hashes"]), 2)
+            self.assertEqual(
+                summary["privacy"],
+                {
+                    "prompt_text_logged": False,
+                    "response_text_logged": False,
+                    "tool_argument_values_logged": False,
+                    "session_paths_logged": False,
+                },
+            )
+            self.assertIsInstance(sources, list)
+            sources_by_file = {source["file_name"]: source for source in sources}
+            self.assertEqual(set(sources_by_file), {"implementation.jsonl", "audit.jsonl"})
+            self.assertEqual(sources_by_file["implementation.jsonl"]["session_id"], "impl-session")
+            self.assertRegex(
+                sources_by_file["implementation.jsonl"]["path_hash"],
+                r"^[0-9a-f]{16}$",
+            )
+            self.assertEqual(
+                sources_by_file["implementation.jsonl"]["event_counts"]["message"],
+                1,
+            )
+            self.assertIn(
+                "impl-assistant",
+                sources_by_file["implementation.jsonl"]["record_ids"],
+            )
+            for source in sources:
+                self.assertNotIn("path", source)
+                self.assertNotIn("cwd", source)
+
+            serialized = self.usage_artifacts_text(handoff)
+            for leaked in (
+                prompt_text,
+                display_text,
+                answer_text,
+                str(secret_path),
+                str(impl_session),
+                str(audit_session),
+                "https://example.invalid/secret-response",
+                "STDOUT_SHOULD_NOT_LEAK",
+                "STDERR_SHOULD_NOT_LEAK",
+                "https://example.invalid/tool-result",
+            ):
+                self.assertNotIn(leaked, serialized)
+
+    def test_harness_exec_writes_usage_artifacts_on_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            repo = Path(temp) / "repo"
+            worktree = Path(temp) / "repo-feature"
+            sessions_root = Path(temp) / "sessions"
+            repo.mkdir()
+            worktree.mkdir()
+            sessions_root.mkdir()
+            output_file = worktree / ".omp" / "handoff" / "implementation-final-response.md"
+            session_file = sessions_root / "failure.jsonl"
+
+            def write_failure_session() -> None:
+                self.write_jsonl_file(
+                    session_file,
+                    [
+                        {"type": "session", "sessionId": "failure-session", "cwd": str(worktree)},
+                        {
+                            "id": "failure-assistant",
+                            "type": "message",
+                            "message": {
+                                "role": "assistant",
+                                "provider": "openai-codex",
+                                "model": "gpt-5.5",
+                                "usage": {
+                                    "input": 6,
+                                    "output": 3,
+                                    "totalTokens": 9,
+                                },
+                            },
+                        },
+                    ],
+                )
+
+            class UsageWritingFailingRunner(FailingHarnessExecRunner):
+                def run(self, args, cwd, *, check=True, capture=True, input_text=None):
+                    if tuple(args[:2]) == ("omp", "-p"):
+                        write_failure_session()
+                    return super().run(
+                        args,
+                        cwd,
+                        check=check,
+                        capture=capture,
+                        input_text=input_text,
+                    )
+
+            runner = UsageWritingFailingRunner(
+                stdout="FAILED_STDOUT_SHOULD_NOT_LEAK",
+                stderr="FAILED_STDERR_SHOULD_NOT_LEAK",
+            )
+            subject = flow.HarnessWorktreeFlow(
+                self.omp_config(repo, repo / "plan.md"), runner
+            )
+            subject.omp_sessions_roots = lambda _repo: [sessions_root]
+
+            with self.assertRaisesRegex(flow.FlowError, "exit code 42"):
+                subject.harness_exec(
+                    worktree,
+                    "FAILURE_PROMPT_SHOULD_NOT_LEAK",
+                    output_file,
+                    phase="implementation",
+                )
+
+            handoff = worktree / ".omp" / "handoff"
+            for name in (
+                "usage-events.jsonl",
+                "usage-summary.json",
+                "usage-sources.json",
+            ):
+                self.assertTrue((handoff / name).exists(), name)
+            events = self.read_jsonl_file(handoff / "usage-events.jsonl")
+            summary = self.read_json_file(handoff / "usage-summary.json")
+            self.assertEqual(events[0]["phase"], "implementation")
+            self.assertEqual(events[0]["status"], "collected")
+            self.assertEqual(events[0]["command_returncode"], 42)
+            self.assertFalse(events[0]["command_timed_out"])
+            self.assertEqual(events[0]["command_duration_ms"], 123)
+            self.assertEqual(summary["phases"]["implementation"]["totals"]["total_tokens"], 9)
+            self.assertEqual(
+                summary["phases"]["implementation"]["status_counts"]["collected"],
+                1,
+            )
+            serialized = self.usage_artifacts_text(handoff)
+            for leaked in (
+                "FAILURE_PROMPT_SHOULD_NOT_LEAK",
+                "FAILED_STDOUT_SHOULD_NOT_LEAK",
+                "FAILED_STDERR_SHOULD_NOT_LEAK",
+                str(output_file.with_name("implementation-final-response-prompt.md")),
+                str(session_file),
+            ):
+                self.assertNotIn(leaked, serialized)
+
+    def test_non_omp_harness_records_unavailable_usage_event(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            repo = Path(temp) / "repo"
+            worktree = Path(temp) / "repo-feature"
+            fake_sessions_root = Path(temp) / "unused-sessions"
+            repo.mkdir()
+            worktree.mkdir()
+            fake_sessions_root.mkdir()
+            output_file = worktree / ".codex" / "handoff" / "implementation-final-response.md"
+            subject = flow.HarnessWorktreeFlow(self.config(repo, repo / "plan.md"), FakeRunner())
+            subject.omp_sessions_roots = lambda _repo: [fake_sessions_root]
+
+            subject.harness_exec(
+                worktree,
+                "NON_OMP_PROMPT_SHOULD_NOT_LEAK",
+                output_file,
+                phase="implementation",
+            )
+
+            handoff = worktree / ".codex" / "handoff"
+            events = self.read_jsonl_file(handoff / "usage-events.jsonl")
+            summary = self.read_json_file(handoff / "usage-summary.json")
+            self.assertEqual(len(events), 1)
+            self.assertEqual(events[0]["phase"], "implementation")
+            self.assertEqual(events[0]["status"], "unavailable")
+            self.assertEqual(events[0]["reason"], "non_omp_harness")
+            self.assertEqual(events[0]["command_returncode"], 0)
+            self.assertFalse(events[0]["command_timed_out"])
+            self.assertEqual(summary["schema_version"], 1)
+            self.assertEqual(
+                summary["phases"]["implementation"]["status_counts"]["unavailable"],
+                1,
+            )
+            self.assertTrue(all(value is False for value in summary["privacy"].values()))
+            self.assertNotIn("NON_OMP_PROMPT_SHOULD_NOT_LEAK", self.usage_artifacts_text(handoff))
 
     def test_stop_merge_mode_does_not_finish(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -1976,6 +2384,53 @@ class HarnessWorktreeFlowTests(unittest.TestCase):
             self.assertEqual((repo / "file.txt").read_text(encoding="utf-8"), "feature\n")
             self.assertIn("file.txt", committed)
             self.assertNotIn(".codex/handoff/implementation-summary.md", committed)
+
+    def write_jsonl_file(self, path: Path, records: list[dict[str, object]]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            "".join(json.dumps(record) + "\n" for record in records),
+            encoding="utf-8",
+        )
+
+    def read_json_file(self, path: Path):
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    def read_jsonl_file(self, path: Path) -> list[dict[str, object]]:
+        return [
+            json.loads(line)
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line
+        ]
+
+    def usage_artifacts_text(self, handoff: Path) -> str:
+        return "\n".join(
+            (handoff / name).read_text(encoding="utf-8")
+            for name in (
+                "usage-events.jsonl",
+                "usage-summary.json",
+                "usage-sources.json",
+            )
+            if (handoff / name).exists()
+        )
+
+    def omp_config(
+        self,
+        repo: Path,
+        plan: Path,
+        *,
+        model: str | None = None,
+        merge_mode: str = "squash",
+    ):
+        return flow.FlowConfig(
+            repo=repo,
+            plan=plan,
+            base="main",
+            model=model,
+            harness="omp",
+            harness_dir=Path(".omp"),
+            merge_mode=merge_mode,
+            keep_worktrees=False,
+        )
 
     def config(
         self,

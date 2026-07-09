@@ -83,6 +83,9 @@ Feature worktree:
 .<harness>/handoff/audit-summary.md
 .<harness>/handoff/audit-final-response.md
 .<harness>/handoff/workflow-state.json
+.<harness>/handoff/usage-events.jsonl
+.<harness>/handoff/usage-summary.json
+.<harness>/handoff/usage-sources.json
 ```
 
 Conflict path only, inside the integration worktree:
@@ -93,6 +96,9 @@ Conflict path only, inside the integration worktree:
 .<harness>/handoff/conflict-resolution-final-response.md
 .<harness>/handoff/post-conflict-audit-summary.md
 .<harness>/handoff/post-conflict-audit-final-response.md
+.<harness>/handoff/usage-events.jsonl
+.<harness>/handoff/usage-summary.json
+.<harness>/handoff/usage-sources.json
 ```
 
 The workflow plan is copied into the feature worktree at:
@@ -107,7 +113,8 @@ Before cleanup, the script archives handoff files and workflow state back into t
 .<harness>/worktree-flow/<run-id>/
 ```
 
-This archive directory contains the copied handoff files and `workflow-state.json`; it is the durable record after the feature and integration worktrees are removed.
+This archive directory contains the copied handoff files, `workflow-state.json`, `workflow.jsonl`, and any usage telemetry files; it is the durable record after the feature and integration worktrees are removed.
+Usage telemetry files contain numeric usage, tool, timing, model/config, and redacted source metadata only. They do not store prompt text, assistant response text, command output, tool argument values, URL bodies, or absolute session paths.
 
 ## Safety Notes
 
