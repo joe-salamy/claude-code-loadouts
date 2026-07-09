@@ -1,0 +1,14 @@
+{
+  "audit_head_before": "cc915c129733bab02016072ba96807863249ea1e",
+  "base": "main",
+  "completed_stage": "cleanup_complete",
+  "feature_branch": "feature/worktree-usage-stats-logging",
+  "feature_worktree": "/mnt/c/Users/joesa/code/harness-loadouts-worktree-usage-stats-logging",
+  "integration_branch": "integration/worktree-usage-stats-logging-20260709-110646",
+  "integration_worktree": "/mnt/c/Users/joesa/code/harness-loadouts-integrate-worktree-usage-stats-logging-20260709-110646",
+  "merge_mode": "squash",
+  "plan_path": "/mnt/c/Users/joesa/code/harness-loadouts-worktree-usage-stats-logging/.omp/worktree-flow/20260709-104914-worktree-usage-stats-logging/plan.md",
+  "plan_title": "Worktree Usage Stats Logging",
+  "run_id": "20260709-104914-worktree-usage-stats-logging",
+  "slug": "worktree-usage-stats-logging"
+}
