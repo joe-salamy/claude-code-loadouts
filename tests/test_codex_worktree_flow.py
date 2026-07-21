@@ -2278,6 +2278,149 @@ class HarnessWorktreeFlowTests(unittest.TestCase):
             self.assertEqual(result, 0)
             self.assertEqual(resumed["worktree"], explicit.resolve())
 
+    def test_main_resume_recovers_missing_primary_plan_from_worktree_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            repo = Path(temp) / "repo"
+            feature = Path(temp) / "repo-feature"
+            missing_plan = repo / ".codex" / "worktree-flow" / "plan-run" / "plan.md"
+            saved_plan = feature / ".codex" / "worktree-flow" / "plan-run" / "plan.md"
+            repo.mkdir()
+            saved_plan.parent.mkdir(parents=True)
+            saved_plan.write_text("# Saved Plan", encoding="utf-8")
+            subject = flow.HarnessWorktreeFlow(
+                self.config(repo, missing_plan), FakeRunner()
+            )
+            state = flow.replace(
+                self.workflow_state(feature),
+                plan_path=str(saved_plan),
+            )
+            subject.save_workflow_state(state, worktree=feature)
+            resumed = {}
+            validated = []
+
+            def fake_resume(self, **kwargs) -> None:
+                resumed.update(kwargs)
+
+            with (
+                mock.patch.object(flow.HarnessWorktreeFlow, "git_root", return_value=repo),
+                mock.patch.object(
+                    flow.HarnessWorktreeFlow,
+                    "validate",
+                    lambda self, _repo, plan: validated.append(plan),
+                ),
+                mock.patch.object(flow.HarnessWorktreeFlow, "resume", fake_resume),
+            ):
+                result = flow.main(
+                    [
+                        "--resume",
+                        "--plan",
+                        str(missing_plan),
+                        "--repo",
+                        str(repo),
+                        "--worktree",
+                        str(feature),
+                        "--harness-dir",
+                        ".codex",
+                    ]
+                )
+
+            self.assertEqual(result, 0)
+            self.assertEqual(validated, [saved_plan.resolve()])
+            self.assertEqual(resumed["plan"], saved_plan.resolve())
+
+    def test_refreshes_generated_integration_commit_after_base_advances(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            repo = Path(temp) / "repo"
+            integration = Path(temp) / "repo-integration"
+            repo.mkdir()
+            integration.mkdir()
+            divergent = flow.CommandResult(
+                ("git", "merge-base"), integration, 1, "", ""
+            )
+            runner = FakeRunner(
+                {
+                    (
+                        "git",
+                        "merge-base",
+                        "--is-ancestor",
+                        "main",
+                        "integration/plan",
+                    ): divergent,
+                    ("git", "branch", "--show-current"): "integration/plan\n",
+                    ("git", "status", "--porcelain", "--untracked-files=all"): "",
+                    (
+                        "git",
+                        "log",
+                        "-1",
+                        "--format=%s",
+                        "integration/plan",
+                    ): "Harness: Plan\n",
+                }
+            )
+            subject = flow.HarnessWorktreeFlow(
+                self.config(repo, repo / "plan.md"), runner
+            )
+            state = flow.replace(
+                self.workflow_state(repo),
+                integration_branch="integration/plan",
+                integration_worktree=str(integration),
+                completed_stage="integration_committed",
+            )
+            subject.save_workflow_state = lambda *_args, **_kwargs: None
+
+            updated = subject.refresh_committed_integration_for_advanced_base(
+                state, integration, "integration/plan"
+            )
+
+            self.assertEqual(updated.completed_stage, "integration_worktree_created")
+            self.assertIn(
+                (("git", "reset", "--hard", "main"), integration, True),
+                runner.calls,
+            )
+
+    def test_refuses_to_refresh_dirty_integration_work(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            repo = Path(temp) / "repo"
+            integration = Path(temp) / "repo-integration"
+            repo.mkdir()
+            integration.mkdir()
+            divergent = flow.CommandResult(
+                ("git", "merge-base"), integration, 1, "", ""
+            )
+            runner = FakeRunner(
+                {
+                    (
+                        "git",
+                        "merge-base",
+                        "--is-ancestor",
+                        "main",
+                        "integration/plan",
+                    ): divergent,
+                    ("git", "branch", "--show-current"): "integration/plan\n",
+                    (
+                        "git",
+                        "status",
+                        "--porcelain",
+                        "--untracked-files=all",
+                    ): " M app.py\n",
+                }
+            )
+            subject = flow.HarnessWorktreeFlow(
+                self.config(repo, repo / "plan.md"), runner
+            )
+            state = flow.replace(
+                self.workflow_state(repo),
+                completed_stage="integration_committed",
+            )
+
+            with self.assertRaisesRegex(flow.FlowError, "pending non-handoff"):
+                subject.refresh_committed_integration_for_advanced_base(
+                    state, integration, "integration/plan"
+                )
+            self.assertFalse(
+                any(call[0][:3] == ("git", "reset", "--hard") for call in runner.calls)
+            )
+
     def test_resume_command_args_uses_saved_workflow_state(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             repo = Path(temp) / "repo"
@@ -2302,7 +2445,10 @@ class HarnessWorktreeFlowTests(unittest.TestCase):
             self.assertEqual(args[0], sys.executable)
             self.assertEqual(args[1], str(Path(flow.__file__).resolve()))
             self.assertIn("--resume", args)
-            self.assertEqual(args[args.index("--plan") + 1], str(plan))
+            self.assertEqual(
+                args[args.index("--plan") + 1],
+                str(subject.resume_plan_path(state)),
+            )
             self.assertEqual(args[args.index("--worktree") + 1], str(feature))
             self.assertEqual(args[args.index("--repo") + 1], str(repo))
             self.assertEqual(args[args.index("--base") + 1], "main")
