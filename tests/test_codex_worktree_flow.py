@@ -232,6 +232,34 @@ print('fake harness output')
         with self.assertRaises(models.FlowError):
             store.load(run_id)
 
+    def test_resume_feature_allocation_requires_plan_before_mutation(self) -> None:
+        plan = self.plan()
+        flow = self.runtime(self.config(plan))
+        self.bind(flow)
+        assert flow.git is not None
+        state_record = make_state(flow, "20260802-120000-approved-plan", plan, flow.git.head(self.repo))
+        plan.unlink()
+        with self.assertRaises(models.FlowError):
+            flow._validate_resume_state(state_record, None)
+        self.assertFalse(flow.git.branch_exists(state_record.feature_branch))
+        self.assertFalse(any(entry.path == Path(state_record.feature_worktree) for entry in flow.git.worktrees()))
+
+    def test_resume_applies_persisted_timeout_to_runner(self) -> None:
+        plan = self.plan()
+        runner = command_runner.CommandRunner()
+        flow = self.runtime(self.config(plan), runner)
+        self.bind(flow)
+        assert flow.git is not None
+        state_record = make_state(flow, "20260802-120000-approved-plan", plan, flow.git.head(self.repo))
+        state_record = models.WorkflowState(**{**state_record.__dict__, "command_timeout_seconds": 2.5})
+        with (
+            mock.patch.object(harness.HarnessAdapter, "validate"),
+            mock.patch.object(harness.HarnessAdapter, "prepare_permissions"),
+        ):
+            updated = flow._apply_resume_configuration(state_record)
+        self.assertEqual(updated.command_timeout_seconds, 2.5)
+        self.assertEqual(runner.command_timeout_seconds, 2.5)
+
     def test_state_replace_failure_preserves_last_good_state(self) -> None:
         plan = self.plan()
         flow = self.runtime(self.config(plan))
@@ -644,6 +672,31 @@ class CommandAndStateTests(unittest.TestCase):
         self.assertEqual(cli.positive_seconds("1.5"), 1.5)
         with self.assertRaises(cli.argparse.ArgumentTypeError):
             cli.positive_seconds("0")
+
+    def test_parser_marks_equals_options_explicit(self) -> None:
+        argv = [
+            "--plan=plan.md",
+            "--resume",
+            "--harness=codex",
+            "--harness-dir=.codex",
+            "--keep-worktrees",
+            "--merge-mode=no-ff",
+            "--model=global",
+            "--implementation-model=implementation",
+            "--review-model=review",
+            "--command-timeout-seconds=2.5",
+        ]
+        parser = cli.build_parser(default_harness="omp", default_harness_dir=Path(".omp"))
+        args = parser.parse_args(argv)
+        config = cli.flow_config_from_args(args, entrypoint_path=Path("worktree-flow.py"), argv=argv)
+        self.assertTrue(config.harness_explicit)
+        self.assertTrue(config.harness_dir_explicit)
+        self.assertTrue(config.keep_worktrees_explicit)
+        self.assertTrue(config.merge_mode_explicit)
+        self.assertTrue(config.model_explicit)
+        self.assertTrue(config.implementation_model_explicit)
+        self.assertTrue(config.review_model_explicit)
+        self.assertTrue(config.command_timeout_explicit)
 
     def test_command_failure_format_excludes_output(self) -> None:
         result = command_runner.CommandResult(("tool", "--arg"), Path("/tmp/worktree"), 2, "SECRET", "SECRET")

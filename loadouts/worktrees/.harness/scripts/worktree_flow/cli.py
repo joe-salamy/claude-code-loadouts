@@ -44,6 +44,10 @@ def build_parser(*, default_harness: str, default_harness_dir: Path) -> argparse
     return parser
 
 
+def _option_supplied(argv: list[str], option: str) -> bool:
+    return any(argument == option or argument.startswith(option + "=") for argument in argv)
+
+
 def flow_config_from_args(args: argparse.Namespace, *, entrypoint_path: Path, argv: list[str]) -> FlowConfig:
     harness_dir = validate_harness_dir(args.harness_dir)
     return FlowConfig(
@@ -64,14 +68,14 @@ def flow_config_from_args(args: argparse.Namespace, *, entrypoint_path: Path, ar
         resume=args.resume,
         entrypoint_path=entrypoint_path.resolve(),
         worktree=Path(args.worktree).expanduser() if args.worktree else None,
-        harness_explicit="--harness" in argv,
-        harness_dir_explicit="--harness-dir" in argv,
-        keep_worktrees_explicit="--keep-worktrees" in argv,
-        merge_mode_explicit="--merge-mode" in argv,
-        model_explicit="--model" in argv,
-        implementation_model_explicit="--implementation-model" in argv,
-        review_model_explicit="--review-model" in argv,
-        command_timeout_explicit="--command-timeout-seconds" in argv,
+        harness_explicit=_option_supplied(argv, "--harness"),
+        harness_dir_explicit=_option_supplied(argv, "--harness-dir"),
+        keep_worktrees_explicit=_option_supplied(argv, "--keep-worktrees"),
+        merge_mode_explicit=_option_supplied(argv, "--merge-mode"),
+        model_explicit=_option_supplied(argv, "--model"),
+        implementation_model_explicit=_option_supplied(argv, "--implementation-model"),
+        review_model_explicit=_option_supplied(argv, "--review-model"),
+        command_timeout_explicit=_option_supplied(argv, "--command-timeout-seconds"),
     )
 
 

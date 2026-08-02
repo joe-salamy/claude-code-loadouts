@@ -359,6 +359,20 @@ class HarnessWorktreeFlow:
         self.git.require_feature_worktree(path, state.feature_branch)
         self.git.require_commit_oid(state.feature_base_commit, label="feature base")
 
+    def _validate_pre_copy_plan(self, state: WorkflowState) -> None:
+        target = canonical_path(
+            Path(state.feature_worktree) / self.worktree_flow_dir / state.run_id / "plan.md",
+            must_exist=False,
+        )
+        if optional_regular_file(target, label="copied plan"):
+            if sha256_file(target) != state.plan_sha256:
+                raise FlowError("Copied plan digest differs from recorded plan_sha256.")
+            return
+        source = Path(state.plan_path)
+        lstat_regular(source, label="source plan")
+        if sha256_file(source) != state.plan_sha256:
+            raise FlowError("Source plan digest differs from workflow state; refusing to continue.")
+
     def _copy_plan_stage(self, state: WorkflowState, plan: Path) -> tuple[WorkflowState, Path]:
         assert self.integration is not None
         target = Path(state.feature_worktree) / self.worktree_flow_dir / state.run_id / "plan.md"
@@ -726,6 +740,8 @@ class HarnessWorktreeFlow:
         self.git.require_feature_worktree(feature_worktree, state.feature_branch)
         self.git.require_clean_except_artifacts(feature_worktree, phase="Feature before fast-forward")
         self.git.require_integration_worktree(integration, state.integration_branch)
+        if self.git.head(integration) != state.integration_commit or self.git.branch_tip(state.integration_branch) != state.integration_commit:
+            raise FlowError("Integration HEAD or branch differs from integration_commit receipt.")
         self.git.require_clean_except_artifacts(integration, phase="Integration before fast-forward")
         self._verify_plan(state)
         feature_head = self.git.head(feature_worktree)
@@ -794,15 +810,19 @@ class HarnessWorktreeFlow:
         self._remove_or_adopt_worktree(target, state.integration_branch, allow_adopt=True, branch_may_be_absent=True)
         if self.git.branch_exists(state.integration_branch):
             self.git.delete_branch(state.integration_branch, force=True)
-
     def _archive(self, state: WorkflowState, source: Path, plan: Path) -> tuple[WorkflowState, Path]:
         assert self.git is not None and self.integration is not None and self.state_store is not None
-        if state.integration_branch is None:
-            raise FlowError("Integration branch is missing before archive.")
+        if state.integration_branch is None or state.integration_commit is None:
+            raise FlowError("Integration state is incomplete before archive.")
         self._verify_plan(state)
-        self.git.require_feature_worktree(Path(state.feature_worktree), state.feature_branch)
-        self.git.require_clean_except_artifacts(Path(state.feature_worktree), phase="Feature before archive")
+        feature_worktree = Path(state.feature_worktree)
+        self.git.require_feature_worktree(feature_worktree, state.feature_branch)
+        self.git.require_clean_except_artifacts(feature_worktree, phase="Feature before archive")
+        if state.audit_head is None or self.git.head(feature_worktree) != state.audit_head:
+            raise FlowError("Feature HEAD changed before archive.")
         self.git.require_integration_worktree(source, state.integration_branch)
+        if self.git.head(source) != state.integration_commit or self.git.branch_tip(state.integration_branch) != state.integration_commit:
+            raise FlowError("Integration HEAD or branch differs from integration_commit receipt.")
         self.git.require_clean_except_artifacts(source, phase="Integration before archive")
         archive = self._archive_candidate(state.run_id)
         self.integration.archive_handoff(source, archive, plan)
@@ -1200,6 +1220,8 @@ class HarnessWorktreeFlow:
                 raise FlowError("Recorded feature worktree disappeared before its checkpoint.")
         elif state.stage is not WorkflowStage.FEATURE_ALLOCATED:
             self._validate_feature_identity(state)
+        if state.stage in {WorkflowStage.FEATURE_ALLOCATED, WorkflowStage.FEATURE_WORKTREE_CREATED}:
+            self._validate_pre_copy_plan(state)
         if state.stage not in {WorkflowStage.FEATURE_ALLOCATED, WorkflowStage.FEATURE_WORKTREE_CREATED, *feature_removed_stages}:
             expected_plan = Path(state.feature_worktree) / self.worktree_flow_dir / state.run_id / "plan.md"
             if canonical_path(expected_plan, must_exist=False) != Path(state.plan_path):
@@ -1314,6 +1336,7 @@ class HarnessWorktreeFlow:
             command_timeout_seconds=timeout,
             keep_worktrees=state.keep_worktrees,
         )
+        self.runner.command_timeout_seconds = timeout
         self._bind_runtime(self.repo, Path(state.git_common_dir))
         assert self.adapter is not None and self.git is not None
         if self.adapter.kind.value != state.harness_kind:

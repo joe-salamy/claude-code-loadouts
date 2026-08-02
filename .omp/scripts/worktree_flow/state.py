@@ -442,9 +442,11 @@ class WorkflowStateStore:
             raise FlowError("Workflow state run_id does not match its state directory.")
         if state.repo_root != str(self.repo_root) or state.git_common_dir != str(self.git_common_dir):
             raise FlowError("Cannot write workflow state for a different repository.")
+        payload = self._payload(state)
+        self._state_from_data(payload, expected_run_id=state.run_id)
         path = self.state_path(state.run_id)
         ensure_directory(path.parent)
-        atomic_write_json(path, self._payload(state), max_bytes=MAX_STATE_BYTES)
+        atomic_write_json(path, payload, max_bytes=MAX_STATE_BYTES)
         return path
 
     def transition(self, state: WorkflowState, target: WorkflowStage, **changes: object) -> WorkflowState:
