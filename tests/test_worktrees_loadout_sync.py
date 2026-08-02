@@ -12,32 +12,29 @@ LOADOUT_SCRIPT_DIRS = (
 )
 
 
-SCRIPT_PAIRS = (
-    "worktree-flow.py",
-    "save-plan.py",
-)
-
-
-def normalized_text(path: Path) -> str:
-    return path.read_text(encoding="utf-8").replace("\r\n", "\n")
+def runtime_files(root: Path) -> dict[Path, bytes]:
+    return {
+        path.relative_to(root): path.read_bytes()
+        for path in root.rglob("*.py")
+        if "__pycache__" not in path.parts
+    }
 
 
 class WorktreesLoadoutSyncTests(unittest.TestCase):
     def test_active_scripts_match_worktrees_loadout_templates(self) -> None:
+        active_files = runtime_files(ACTIVE_SCRIPTS)
         for loadout_scripts in LOADOUT_SCRIPT_DIRS:
-            for script_name in SCRIPT_PAIRS:
-                active = ACTIVE_SCRIPTS / script_name
-                loadout = loadout_scripts / script_name
-                with self.subTest(script=script_name, loadout=loadout_scripts):
-                    self.assertTrue(active.exists(), f"Missing active script: {active}")
-                    self.assertTrue(loadout.exists(), f"Missing loadout script: {loadout}")
+            with self.subTest(loadout=loadout_scripts):
+                self.assertEqual(
+                    set(active_files),
+                    set(runtime_files(loadout_scripts)),
+                    "The shipped runtime .py file set must match the canonical scripts.",
+                )
+                for relative_path, active_bytes in active_files.items():
                     self.assertEqual(
-                        normalized_text(active),
-                        normalized_text(loadout),
-                        (
-                            f"{active} and {loadout} are out of sync. Update the "
-                            "active script and shipped worktrees loadout copy together."
-                        ),
+                        active_bytes,
+                        (loadout_scripts / relative_path).read_bytes(),
+                        f"Runtime bytes differ for {relative_path} in {loadout_scripts}.",
                     )
 
 

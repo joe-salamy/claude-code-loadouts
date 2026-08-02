@@ -1,2614 +1,768 @@
 from __future__ import annotations
 
+import contextlib
 import io
-import importlib.util
-from contextlib import redirect_stderr, redirect_stdout
 import json
+import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
 import unittest
-from unittest import mock
 from pathlib import Path
+from unittest import mock
 
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPT_DIR = ROOT / ".omp" / "scripts"
+sys.path.insert(0, str(SCRIPT_DIR))
 
-SCRIPT_DIR = Path(__file__).resolve().parents[1] / ".omp" / "scripts"
-
-
-def load_flow_module(name: str, script_name: str):
-    spec = importlib.util.spec_from_file_location(name, SCRIPT_DIR / script_name)
-    module = importlib.util.module_from_spec(spec)
-    assert spec and spec.loader
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-flow = load_flow_module("worktree_flow", "worktree-flow.py")
+from worktree_flow import cli, command_runner, git_workspace, harness, integration, models, paths, state, usage, workflow  # noqa: E402
 
 
 class FakeRunner:
     def __init__(
         self,
-        outputs: dict[
-            tuple[str, ...], flow.CommandResult | list[str] | str
-        ] | None = None,
+        outputs: dict[tuple[str, ...], command_runner.CommandResult | str] | None = None,
         *,
         dry_run: bool = False,
     ) -> None:
         self.outputs = outputs or {}
-        self.calls: list[tuple[tuple[str, ...], Path, bool]] = []
-        self.inputs: list[str | None] = []
+        self.calls: list[tuple[tuple[str, ...], Path, bool, str | None]] = []
         self.dry_run = dry_run
 
-    def run(self, args, cwd, *, check=True, capture=True, input_text=None):
-        key = tuple(args)
-        self.calls.append((key, Path(cwd), check))
-        self.inputs.append(input_text)
+    def run(
+        self,
+        args: list[str] | tuple[str, ...],
+        cwd: Path,
+        *,
+        check: bool = True,
+        capture: bool = True,
+        input_text: str | None = None,
+    ) -> command_runner.CommandResult:
+        del capture
+        key = tuple(str(arg) for arg in args)
+        self.calls.append((key, Path(cwd), check, input_text))
         value = self.outputs.get(key, "")
-        if isinstance(value, flow.CommandResult):
+        if isinstance(value, command_runner.CommandResult):
             return value
-        if isinstance(value, list):
-            stdout = value.pop(0) if value else ""
-        else:
-            stdout = value
-        return flow.CommandResult(key, Path(cwd), 0, stdout, "")
+        return command_runner.CommandResult(
+            key,
+            Path(cwd),
+            0,
+            value,
+            "",
+            started_at="start",
+            finished_at="finish",
+            duration_ms=1,
+        )
 
 
-class FailingFastForwardRunner(FakeRunner):
+class FailingRunner(FakeRunner):
+    def __init__(self, command_prefix: tuple[str, ...]) -> None:
+        super().__init__()
+        self.command_prefix = command_prefix
+
     def run(self, args, cwd, *, check=True, capture=True, input_text=None):
-        if tuple(args[:3]) == ("git", "merge", "--ff-only"):
-            result = flow.CommandResult(tuple(args), Path(cwd), 1, "", "not a fast-forward")
+        key = tuple(str(arg) for arg in args)
+        if key[: len(self.command_prefix)] == self.command_prefix:
+            result = command_runner.CommandResult(key, Path(cwd), 1, "", "failed")
             if check:
-                raise flow.FlowError(flow.format_command_failure(result))
+                raise command_runner.CommandFailureError(result)
             return result
         return super().run(args, cwd, check=check, capture=capture, input_text=input_text)
 
 
-class FailingSquashMergeRunner(FakeRunner):
-    def __init__(self, *, unmerged_paths: str, timed_out: bool = False) -> None:
-        super().__init__()
-        self.unmerged_paths = unmerged_paths
-        self.timed_out = timed_out
-
-    def run(self, args, cwd, *, check=True, capture=True, input_text=None):
-        key = tuple(args)
-        if key[:3] == ("git", "merge", "--squash"):
-            self.calls.append((key, Path(cwd), check))
-            return flow.CommandResult(
-                key,
-                Path(cwd),
-                -9 if self.timed_out else 1,
-                "",
-                "merge timed out" if self.timed_out else "merge failed",
-                timed_out=self.timed_out,
-            )
-        if key == ("git", "diff", "--name-only", "--diff-filter=U"):
-            self.calls.append((key, Path(cwd), check))
-            return flow.CommandResult(key, Path(cwd), 0, self.unmerged_paths, "")
-        return super().run(args, cwd, check=check, capture=capture, input_text=input_text)
-
-
-class FailingNoFfMergeRunner(FakeRunner):
-    def __init__(self, *, unmerged_paths: str, timed_out: bool = False) -> None:
-        super().__init__()
-        self.unmerged_paths = unmerged_paths
-        self.timed_out = timed_out
-
-    def run(self, args, cwd, *, check=True, capture=True, input_text=None):
-        key = tuple(args)
-        if key[:4] == ("git", "merge", "--no-ff", "--no-commit"):
-            self.calls.append((key, Path(cwd), check))
-            return flow.CommandResult(
-                key,
-                Path(cwd),
-                -9 if self.timed_out else 1,
-                "",
-                "merge timed out" if self.timed_out else "merge failed",
-                timed_out=self.timed_out,
-            )
-        if key == ("git", "diff", "--name-only", "--diff-filter=U"):
-            self.calls.append((key, Path(cwd), check))
-            return flow.CommandResult(key, Path(cwd), 0, self.unmerged_paths, "")
-        return super().run(args, cwd, check=check, capture=capture, input_text=input_text)
-
-
-class FailingHarnessExecRunner(FakeRunner):
-    def __init__(
-        self,
-        *,
-        stdout: str,
-        stderr: str,
-        returncode: int = 42,
-        timed_out: bool = False,
-    ) -> None:
-        super().__init__()
-        self.stdout_text = stdout
-        self.stderr_text = stderr
-        self.returncode = returncode
-        self.timed_out = timed_out
-
-    def run(self, args, cwd, *, check=True, capture=True, input_text=None):
-        key = tuple(args)
-        if key[:2] in {("codex", "exec"), ("omp", "-p")}:
-            self.calls.append((key, Path(cwd), check))
-            self.inputs.append(input_text)
-            return flow.CommandResult(
-                key,
-                Path(cwd),
-                self.returncode,
-                self.stdout_text,
-                self.stderr_text,
-                started_at="start",
-                finished_at="finish",
-                duration_ms=123,
-                timed_out=self.timed_out,
-            )
-        return super().run(args, cwd, check=check, capture=capture, input_text=input_text)
-
-
-class CommandRunnerTests(unittest.TestCase):
-    def test_run_resolves_executable_before_invoking_subprocess(self) -> None:
-        completed = subprocess.CompletedProcess(
-            ["C:/bin/codex.CMD", "exec", "--help"],
-            0,
-            "ok",
-            "",
-        )
-        with (
-            tempfile.TemporaryDirectory() as temp,
-            mock.patch.object(flow.shutil, "which", return_value="C:/bin/codex.CMD") as which,
-            mock.patch.object(flow.subprocess, "run", return_value=completed) as run,
-        ):
-            result = flow.CommandRunner().run(["codex", "exec", "--help"], Path(temp))
-
-        which.assert_called_once_with("codex")
-        run.assert_called_once()
-        self.assertEqual(
-            run.call_args.args[0],
-            ["C:/bin/codex.CMD", "exec", "--help"],
-        )
-        self.assertEqual(result.args, ("codex", "exec", "--help"))
-        self.assertEqual(result.stdout, "ok")
-
-
-    def test_run_records_duration_fields_on_success(self) -> None:
-        completed = subprocess.CompletedProcess(
-            ["C:/bin/codex.CMD", "exec", "--help"],
-            0,
-            "ok",
-            "",
-        )
-        with (
-            tempfile.TemporaryDirectory() as temp,
-            mock.patch.object(flow.shutil, "which", return_value="C:/bin/codex.CMD"),
-            mock.patch.object(flow.subprocess, "run", return_value=completed) as run,
-            mock.patch.object(flow, "now_iso", side_effect=["start", "finish"]),
-            mock.patch.object(flow.time, "perf_counter", side_effect=[10.0, 10.25]),
-        ):
-            result = flow.CommandRunner().run(["codex", "exec", "--help"], Path(temp))
-
-        self.assertEqual(result.started_at, "start")
-        self.assertEqual(result.finished_at, "finish")
-        self.assertEqual(result.duration_ms, 250)
-        self.assertFalse(result.timed_out)
-        self.assertIsNone(run.call_args.kwargs["timeout"])
-
-    def test_run_marks_timeout_when_check_disabled(self) -> None:
-        expired = subprocess.TimeoutExpired(
-            ["C:/bin/codex.CMD", "exec", "--help"],
-            2.5,
-            output=b"partial stdout",
-            stderr=b"partial stderr",
-        )
-        with (
-            tempfile.TemporaryDirectory() as temp,
-            mock.patch.object(flow.shutil, "which", return_value="C:/bin/codex.CMD"),
-            mock.patch.object(flow.subprocess, "run", side_effect=expired) as run,
-            mock.patch.object(flow, "now_iso", side_effect=["start", "finish"]),
-            mock.patch.object(flow.time, "perf_counter", side_effect=[4.0, 6.5]),
-        ):
-            result = flow.CommandRunner(command_timeout_seconds=2.5).run(
-                ["codex", "exec", "--help"],
-                Path(temp),
-                check=False,
-            )
-
-        self.assertTrue(result.timed_out)
-        self.assertEqual(result.returncode, -9)
-        self.assertEqual(result.stdout, "partial stdout")
-        self.assertEqual(result.stderr, "partial stderr")
-        self.assertEqual(result.started_at, "start")
-        self.assertEqual(result.finished_at, "finish")
-        self.assertEqual(result.duration_ms, 2500)
-        self.assertEqual(run.call_args.kwargs["timeout"], 2.5)
-
-    def test_run_raises_clear_flow_error_on_checked_timeout(self) -> None:
-        expired = subprocess.TimeoutExpired(
-            ["C:/bin/codex.CMD", "exec", "--help"],
-            1.0,
-            output="partial stdout",
-            stderr="partial stderr",
-        )
-        with (
-            tempfile.TemporaryDirectory() as temp,
-            mock.patch.object(flow.shutil, "which", return_value="C:/bin/codex.CMD"),
-            mock.patch.object(flow.subprocess, "run", side_effect=expired),
-            self.assertRaisesRegex(
-                flow.CommandFailureError, "Command timed out: codex exec --help"
-            ),
-        ):
-            flow.CommandRunner(command_timeout_seconds=1.0).run(
-                ["codex", "exec", "--help"],
-                Path(temp),
-            )
-
-    def test_run_reports_missing_executable_as_flow_error(self) -> None:
-        with (
-            tempfile.TemporaryDirectory() as temp,
-            mock.patch.object(flow.shutil, "which", return_value=None),
-            mock.patch.object(flow.subprocess, "run") as run,
-            self.assertRaisesRegex(flow.FlowError, "Executable not found on PATH: codex"),
-        ):
-            flow.CommandRunner().run(["codex", "exec", "--help"], Path(temp))
-
-        run.assert_not_called()
-
-    def test_run_reports_launch_oserror_as_flow_error(self) -> None:
-        with (
-            tempfile.TemporaryDirectory() as temp,
-            mock.patch.object(flow.shutil, "which", return_value="C:/bin/codex.CMD"),
-            mock.patch.object(
-                flow.subprocess,
-                "run",
-                side_effect=FileNotFoundError("missing shim target"),
-            ),
-            self.assertRaisesRegex(flow.FlowError, "Failed to run command: codex exec --help"),
-        ):
-            flow.CommandRunner().run(["codex", "exec", "--help"], Path(temp))
-
-
-class SharedHarnessSelectionTests(unittest.TestCase):
-    def test_shared_defaults_are_inferred_from_active_script_directory(self) -> None:
-        self.assertEqual(flow.DEFAULT_HARNESS, "omp")
-        self.assertEqual(flow.HARNESS_DIR, Path(".omp"))
-        self.assertEqual(flow.HANDOFF_DIR, Path(".omp") / "handoff")
-
-    def test_shared_parser_accepts_codex_harness_options(self) -> None:
-        args = flow.build_parser().parse_args(
-            [
-                "--plan",
-                "docs/plans/p.md",
-                "--harness",
-                "codex",
-                "--harness-dir",
-                ".codex",
-            ]
-        )
-
-        self.assertEqual(args.harness, "codex")
-        self.assertEqual(args.harness_dir, ".codex")
-
-    def test_shared_parser_accepts_omp_harness_options(self) -> None:
-        args = flow.build_parser().parse_args(
-            ["--plan", "docs/plans/p.md", "--harness", "omp", "--harness-dir", ".omp"]
-        )
-
-        self.assertEqual(args.harness, "omp")
-        self.assertEqual(args.harness_dir, ".omp")
-
-    def test_shared_parser_can_override_harness_dir(self) -> None:
-        args = flow.build_parser().parse_args(
-            ["--plan", "docs/plans/p.md", "--harness-dir", ".custom"]
-        )
-
-        self.assertEqual(args.harness_dir, ".custom")
-
-    def test_shared_parser_leaves_base_unset_for_auto_detection(self) -> None:
-        args = flow.build_parser().parse_args(["--plan", "docs/plans/p.md"])
-
-        self.assertIsNone(args.base)
-
-    def test_validate_omp_harness_checks_current_cli_help(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            repo = Path(temp) / "repo"
-            plan = repo / "plan.md"
-            repo.mkdir()
-            plan.write_text("# Plan", encoding="utf-8")
-            runner = FakeRunner()
-            config = flow.FlowConfig(
-                repo=repo,
-                plan=plan,
-                base="main",
-                model=None,
-                harness="omp",
-                harness_dir=Path(".omp"),
-                merge_mode="squash",
-                keep_worktrees=False,
-            )
-            subject = flow.HarnessWorktreeFlow(config, runner)
-
-            subject.validate(repo, plan)
-
-            commands = [call[0] for call in runner.calls]
-            self.assertIn(("omp", "--help"), commands)
-            self.assertNotIn(("omp", "exec", "--help"), commands)
-
-
-    def test_omp_harness_exec_uses_print_mode_prompt_file_and_writes_stdout(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            repo = Path(temp) / "repo"
-            repo.mkdir()
-            (repo / ".omp" / "handoff").mkdir(parents=True)
-            output_file = repo / ".omp" / "handoff" / "implementation-final-response.md"
-            prompt_file = output_file.with_name("implementation-final-response-prompt.md")
-            args = (
-                "omp",
-                "-p",
-                "--no-session",
-                "--auto-approve",
-                "--approval-mode",
-                "yolo",
-                f"@{prompt_file}",
-            )
-            runner = FakeRunner({args: "Final response"})
-            config = flow.FlowConfig(
-                repo=repo,
-                plan=repo / "plan.md",
-                base="main",
-                model=None,
-                harness="omp",
-                harness_dir=Path(".omp"),
-                merge_mode="squash",
-                keep_worktrees=False,
-            )
-            subject = flow.HarnessWorktreeFlow(config, runner)
-            subject.omp_sessions_roots = lambda _repo: []
-
-            subject.harness_exec(repo, "Prompt", output_file, phase="implementation")
-
-            self.assertEqual(runner.calls[-1][0], args)
-            self.assertIsNone(runner.inputs[-1])
-            self.assertEqual(output_file.read_text(encoding="utf-8"), "Final response")
-            self.assertFalse(prompt_file.exists())
-
-
-
-
-class HarnessWorktreeFlowTests(unittest.TestCase):
-    def test_print_checkpoint_formats_details(self) -> None:
-        buffer = io.StringIO()
-
-        with redirect_stdout(buffer):
-            flow.HarnessWorktreeFlow.print_checkpoint(
-                "start",
-                "Implementation",
-                (
-                    ("worktree", Path("repo-plan")),
-                    ("empty", ""),
-                    ("missing", None),
-                ),
-            )
-
-        self.assertEqual(
-            buffer.getvalue(), "[start] Implementation\n  worktree: repo-plan\n"
-        )
-
-    def test_slug_uses_first_h1(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            plan = Path(temp) / "plan.md"
-            plan.write_text("# Add Better Audit Flow!\n\nBody", encoding="utf-8")
-            self.assertEqual(flow.derive_slug(plan), "add-better-audit-flow")
-
-    def test_slug_falls_back_to_filename(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            plan = Path(temp) / "My Plan File.md"
-            plan.write_text("No heading", encoding="utf-8")
-            self.assertEqual(flow.derive_slug(plan), "my-plan-file")
-
-    def test_unique_names_skip_existing_branch_and_worktree(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            repo = Path(temp) / "repo"
-            repo.mkdir()
-            (Path(temp) / "repo-example").mkdir()
-            runner = FakeRunner(
-                {
-                    ("git", "branch", "--list", "feature/example"): "feature/example\n",
-                    ("git", "branch", "--list", "feature/example-2"): "",
-                }
-            )
-            config = self.config(repo, repo / "plan.md")
-            names = flow.HarnessWorktreeFlow(config, runner).unique_feature_names(repo, "example")
-            self.assertEqual(names.branch, "feature/example-2")
-            self.assertEqual(names.worktree.name, "repo-example-2")
-            self.assertRegex(names.run_id, r"^\d{8}-\d{6}-example-2$")
-
-    def test_run_id_from_saved_worktree_flow_plan_is_reused(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            repo = Path(temp) / "repo"
-            plan = repo / ".codex" / "worktree-flow" / "20260629-082455-plan" / "plan.md"
-            plan.parent.mkdir(parents=True)
-            plan.write_text("# Plan", encoding="utf-8")
-            subject = flow.HarnessWorktreeFlow(self.config(repo, plan), FakeRunner())
-
-            self.assertEqual(
-                subject.run_id_from_plan(repo, plan),
-                "20260629-082455-plan",
-            )
-
-    def test_validate_auto_detects_master_when_main_is_absent(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            repo = Path(temp) / "repo"
-            plan = repo / "plan.md"
-            repo.mkdir()
-            plan.write_text("# Plan", encoding="utf-8")
-            runner = FakeRunner(
-                {
-                    (
-                        "git",
-                        "rev-parse",
-                        "--verify",
-                        "--quiet",
-                        "main",
-                    ): flow.CommandResult((), repo, 1, "", ""),
-                    (
-                        "git",
-                        "rev-parse",
-                        "--verify",
-                        "--quiet",
-                        "master",
-                    ): flow.CommandResult((), repo, 0, "master\n", ""),
-                }
-            )
-            config = flow.FlowConfig(
-                repo=repo,
-                plan=plan,
-                base=None,
-                model=None,
-                harness="codex",
-                harness_dir=Path(".codex"),
-                merge_mode="squash",
-                keep_worktrees=False,
-            )
-            subject = flow.HarnessWorktreeFlow(config, runner)
-
-            subject.validate(repo, plan)
-
-            self.assertEqual(subject.base, "master")
-
-    def test_validate_falls_back_to_current_branch_when_main_and_master_are_absent(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            repo = Path(temp) / "repo"
-            plan = repo / "plan.md"
-            repo.mkdir()
-            plan.write_text("# Plan", encoding="utf-8")
-            runner = FakeRunner(
-                {
-                    (
-                        "git",
-                        "rev-parse",
-                        "--verify",
-                        "--quiet",
-                        "main",
-                    ): flow.CommandResult((), repo, 1, "", ""),
-                    (
-                        "git",
-                        "rev-parse",
-                        "--verify",
-                        "--quiet",
-                        "master",
-                    ): flow.CommandResult((), repo, 1, "", ""),
-                    ("git", "branch", "--show-current"): "trunk\n",
-                }
-            )
-            config = flow.FlowConfig(
-                repo=repo,
-                plan=plan,
-                base=None,
-                model=None,
-                harness="codex",
-                harness_dir=Path(".codex"),
-                merge_mode="squash",
-                keep_worktrees=False,
-            )
-            subject = flow.HarnessWorktreeFlow(config, runner)
-
-            subject.validate(repo, plan)
-
-            self.assertEqual(subject.base, "trunk")
-
-    def test_validate_does_not_fallback_when_explicit_base_is_missing(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            repo = Path(temp) / "repo"
-            plan = repo / "plan.md"
-            repo.mkdir()
-            plan.write_text("# Plan", encoding="utf-8")
-            runner = FakeRunner(
-                {
-                    (
-                        "git",
-                        "rev-parse",
-                        "--verify",
-                        "--quiet",
-                        "main",
-                    ): flow.CommandResult((), repo, 1, "", ""),
-                }
-            )
-            subject = flow.HarnessWorktreeFlow(self.config(repo, plan), runner)
-
-            with self.assertRaisesRegex(
-                flow.FlowError, "Base ref does not exist: main"
-            ):
-                subject.validate(repo, plan)
-
-    def test_plan_inside_repo_is_copied_to_workflow_dir(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            repo = Path(temp) / "repo"
-            worktree = Path(temp) / "repo-feature"
-            plan = repo / "docs" / "plans" / "p.md"
-            names = flow.Names(
-                "plan",
-                "feature/plan",
-                worktree,
-                "20260629-082455-plan",
-            )
-            target = (
-                worktree
-                / ".codex"
-                / "worktree-flow"
-                / "20260629-082455-plan"
-                / "plan.md"
-            )
-            repo.mkdir()
-            plan.parent.mkdir(parents=True)
-            plan.write_text("# Plan", encoding="utf-8")
-            actual = flow.HarnessWorktreeFlow(
-                self.config(repo, plan), FakeRunner()
-            ).ensure_plan_in_worktree(repo, plan, worktree, names)
-            self.assertEqual(actual, target)
-            self.assertEqual(actual.read_text(encoding="utf-8"), "# Plan")
-
-    def test_dry_run_plan_copy_does_not_mutate_filesystem(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            repo = Path(temp) / "repo"
-            worktree = Path(temp) / "repo-feature"
-            plan = Path(temp) / "external.md"
-            repo.mkdir()
-            worktree.mkdir()
-            plan.write_text("# External", encoding="utf-8")
-
-            names = flow.Names(
-                "external",
-                "feature/external",
-                worktree,
-                "20260629-082455-external",
-            )
-            actual = flow.HarnessWorktreeFlow(
-                self.config(repo, plan), FakeRunner(dry_run=True)
-            ).ensure_plan_in_worktree(repo, plan, worktree, names)
-
-            self.assertEqual(
-                actual,
-                worktree
-                / ".codex"
-                / "worktree-flow"
-                / "20260629-082455-external"
-                / "plan.md",
-            )
-            self.assertFalse(actual.exists())
-
-    def test_dry_run_archive_handoff_does_not_mutate_filesystem(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            repo = Path(temp) / "repo"
-            worktree = Path(temp) / "repo-feature"
-            source = worktree / ".codex" / "handoff"
-            repo.mkdir()
-            source.mkdir(parents=True)
-            (source / "implementation-summary.md").write_text("impl", encoding="utf-8")
-
-            archive = flow.HarnessWorktreeFlow(
-                self.config(repo, repo / "plan.md"), FakeRunner(dry_run=True)
-            ).archive_handoff(repo, worktree, "plan-run")
-
-            self.assertEqual(archive, repo / ".codex" / "worktree-flow" / "plan-run")
-            self.assertFalse(archive.exists())
-
-    def test_archive_handoff_copies_usage_artifacts(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            repo = Path(temp) / "repo"
-            worktree = Path(temp) / "repo-feature"
-            handoff = worktree / ".codex" / "handoff"
-            repo.mkdir()
-            handoff.mkdir(parents=True)
-            artifacts = {
-                "usage-events.jsonl": '{"phase":"implementation"}\n',
-                "usage-summary.json": '{"schema_version":1}\n',
-                "usage-sources.json": '[{"source_id":"session-1"}]\n',
-            }
-            for name, content in artifacts.items():
-                (handoff / name).write_text(content, encoding="utf-8")
-
-            archive = flow.HarnessWorktreeFlow(
-                self.config(repo, repo / "plan.md"), FakeRunner()
-            ).archive_handoff(repo, worktree, "plan-run")
-
-            self.assertEqual(archive, repo / ".codex" / "worktree-flow" / "plan-run")
-            for name, content in artifacts.items():
-                self.assertEqual(
-                    (archive / name).read_text(encoding="utf-8"),
-                    content,
-                )
-
-    def test_prepare_harness_permissions_grants_sandbox_group_on_windows(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            harness_dir = Path(temp) / ".codex"
-            harness_dir.mkdir()
-            completed = subprocess.CompletedProcess(["pwsh"], 0, "", "")
-            subject = flow.HarnessWorktreeFlow(
-                self.config(Path(temp), Path(temp) / "plan.md"), FakeRunner()
-            )
-
-            with (
-                mock.patch.object(flow.os, "name", "nt"),
-                mock.patch.object(flow.shutil, "which", return_value="C:/PowerShell/pwsh.exe"),
-                mock.patch.object(flow.subprocess, "run", return_value=completed) as run,
-            ):
-                subject.prepare_harness_permissions(harness_dir)
-
-            args = run.call_args.args[0]
-            kwargs = run.call_args.kwargs
-            self.assertEqual(args[0], "C:/PowerShell/pwsh.exe")
-            self.assertEqual(kwargs["env"]["CODEX_PERMISSION_ROOT"], str(harness_dir))
-            self.assertEqual(kwargs["env"]["CODEX_PERMISSION_GROUP"], "CodexSandboxUsers")
-            self.assertIn("RemoveAccessRuleSpecific", args[4])
-
-    def test_prepare_git_permissions_grants_external_common_git_dir(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            repo = Path(temp) / "repo"
-            worktree = Path(temp) / "repo-feature"
-            common_git = repo / ".git"
-            repo.mkdir()
-            worktree.mkdir()
-            common_git.mkdir()
-            subject = flow.HarnessWorktreeFlow(
-                self.config(repo, repo / "plan.md"),
-                FakeRunner(
-                    {
-                        ("git", "rev-parse", "--git-common-dir"): str(common_git),
-                    }
-                ),
-            )
-            prepared: list[Path] = []
-            subject.prepare_harness_permissions = prepared.append
-
-            subject.prepare_git_permissions(worktree)
-
-            self.assertEqual(prepared, [common_git.resolve()])
-
-    def test_extra_writable_roots_include_harness_and_external_git_dir(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            repo = Path(temp) / "repo"
-            worktree = Path(temp) / "repo-feature"
-            common_git = repo / ".git"
-            harness_dir = worktree / ".codex"
-            repo.mkdir()
-            worktree.mkdir()
-            common_git.mkdir()
-            harness_dir.mkdir()
-            runner = FakeRunner(
-                {
-                    ("git", "rev-parse", "--git-common-dir"): str(common_git),
-                }
-            )
-            subject = flow.HarnessWorktreeFlow(self.config(repo, repo / "plan.md"), runner)
-
-            roots = subject.extra_writable_roots(worktree)
-
-            self.assertEqual(roots, [harness_dir.resolve(), common_git.resolve()])
-
-
-    def test_harness_exec_adds_harness_and_common_git_dirs_as_writable_roots(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            repo = Path(temp) / "repo"
-            worktree = Path(temp) / "repo-feature"
-            common_git = repo / ".git"
-            harness_dir = worktree / ".codex"
-            repo.mkdir()
-            worktree.mkdir()
-            common_git.mkdir()
-            harness_dir.mkdir()
-            runner = FakeRunner(
-                {
-                    ("git", "rev-parse", "--git-common-dir"): str(common_git),
-                }
-            )
-            subject = flow.HarnessWorktreeFlow(self.config(repo, repo / "plan.md"), runner)
-            subject.omp_sessions_roots = lambda _repo: []
-
-            subject.harness_exec(
-                worktree,
-                "Prompt",
-                worktree / ".codex" / "handoff" / "implementation-final-response.md",
-                phase="implementation",
-            )
-
-            args = runner.calls[-1][0]
-            writable_roots = [
-                args[index + 1]
-                for index, value in enumerate(args)
-                if value == "--add-dir"
-            ]
-            self.assertEqual(
-                writable_roots,
-                [str(harness_dir.resolve()), str(common_git.resolve())],
-            )
-
-    def test_harness_exec_uses_full_access_sandbox_on_windows(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            repo = Path(temp) / "repo"
-            repo.mkdir()
-            runner = FakeRunner()
-            subject = flow.HarnessWorktreeFlow(self.config(repo, repo / "plan.md"), runner)
-            subject.omp_sessions_roots = lambda _repo: []
-
-            with mock.patch.object(flow.os, "name", "nt"):
-                subject.harness_exec(repo, "Prompt", repo / "out.md", phase="implementation")
-
-            args = runner.calls[-1][0]
-            sandbox_index = args.index("--sandbox")
-            self.assertEqual(args[sandbox_index + 1], "danger-full-access")
-
-    def test_harness_exec_uses_workspace_write_sandbox_off_windows(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            repo = Path(temp) / "repo"
-            repo.mkdir()
-            runner = FakeRunner()
-            subject = flow.HarnessWorktreeFlow(self.config(repo, repo / "plan.md"), runner)
-            subject.omp_sessions_roots = lambda _repo: []
-
-            with mock.patch.object(flow.os, "name", "posix"):
-                subject.harness_exec(repo, "Prompt", repo / "out.md", phase="implementation")
-
-            args = runner.calls[-1][0]
-            sandbox_index = args.index("--sandbox")
-            self.assertEqual(args[sandbox_index + 1], "workspace-write")
-
-    def test_run_prepares_primary_repo_permissions_before_logging(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            repo = Path(temp) / "repo"
-            worktree = Path(temp) / "repo-plan"
-            plan = repo / "docs" / "plans" / "plan.md"
-            repo.mkdir()
-            (repo / ".codex").mkdir()
-            plan.parent.mkdir(parents=True)
-            plan.write_text("# Plan", encoding="utf-8")
-            (worktree / "docs" / "plans").mkdir(parents=True)
-            (worktree / "docs" / "plans" / "plan.md").write_text("# Plan", encoding="utf-8")
-            handoff = worktree / ".codex" / "handoff"
-            handoff.mkdir(parents=True)
-            (handoff / "implementation-summary.md").write_text("impl", encoding="utf-8")
-            (handoff / "audit-summary.md").write_text("audit", encoding="utf-8")
-            runner = FakeRunner(
-                {
-                    ("git", "branch", "--list", "feature/plan"): "",
-                    ("git", "rev-parse", "--git-common-dir"): ".git",
-                }
-            )
-            subject = flow.HarnessWorktreeFlow(
-                self.config(repo, plan, merge_mode="stop"), runner
-            )
-            prepared: list[Path] = []
-            subject.prepare_harness_permissions = prepared.append
-            subject.create_feature_worktree = lambda _repo, _names: None
-            subject.run_implementation = lambda _worktree, _plan: None
-            subject.run_audit = lambda _worktree, _plan: None
-            subject.require_implementation_invariants = lambda _worktree, _branch: None
-            subject.head_rev = lambda _worktree: "before"
-            subject.require_audit_invariants = lambda _worktree, _branch, _head: None
-            subject.require_commits_since_base = lambda *_args: None
-            subject.require_branch_changed_since_base = lambda *_args: None
-            subject.unique_feature_names = lambda _repo, _slug, _run_id=None: flow.Names(
-                "plan", "feature/plan", worktree, "plan-run"
-            )
-            subject.validate = lambda _repo, _plan: None
-            subject.finish = lambda *_args: (_ for _ in ()).throw(
-                AssertionError("finish should not run")
-            )
-
-            subject.run()
-
-            self.assertEqual(prepared[0], repo / ".codex")
-
-    def test_stage_integration_changes_excludes_handoff_artifacts(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            repo = Path(temp) / "repo"
-            runner = FakeRunner()
-            subject = flow.HarnessWorktreeFlow(self.config(repo, repo / "plan.md"), runner)
-
-            subject.stage_integration_changes(repo)
-
-            self.assertEqual(runner.calls[0][0], ("git", "add", "-A"))
-            self.assertEqual(
-                runner.calls[1],
-                (("git", "reset", "HEAD", "--", ".codex/handoff"), repo, False),
-            )
-
-
-    def test_tracked_handoff_artifacts_warn(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            repo = Path(temp) / "repo"
-            runner = FakeRunner(
-                {
-                    (
-                        "git",
-                        "ls-tree",
-                        "-r",
-                        "--name-only",
-                        "feature/plan",
-                        "--",
-                        ".codex/handoff",
-                    ): ".codex/handoff/audit-summary.md\n",
-                }
-            )
-            subject = flow.HarnessWorktreeFlow(self.config(repo, repo / "plan.md"), runner)
-
-            stderr = io.StringIO()
-            with redirect_stderr(stderr):
-                subject.require_no_tracked_handoff_artifacts(repo, "feature/plan")
-
-            warning = stderr.getvalue()
-            self.assertIn(
-                "Warning: workflow handoff artifacts are tracked in feature/plan.",
-                warning,
-            )
-            self.assertIn(".codex/handoff/audit-summary.md", warning)
-
-    def test_implementation_fails_when_no_commit_exists_after_base(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            repo = Path(temp) / "repo"
-            subject = flow.HarnessWorktreeFlow(
-                self.config(repo, repo / "plan.md"),
-                FakeRunner({("git", "rev-list", "--count", "main..feature/plan"): "0\n"}),
-            )
-
-            with self.assertRaisesRegex(flow.FlowError, "did not create any commits"):
-                subject.require_implementation_invariants(repo, "feature/plan")
-
-    def test_implementation_fails_when_branch_has_no_diff_from_base(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            repo = Path(temp) / "repo"
-            subject = flow.HarnessWorktreeFlow(
-                self.config(repo, repo / "plan.md"),
-                FakeRunner(
-                    {
-                        ("git", "rev-list", "--count", "main..feature/plan"): "1\n",
-                        (
-                            "git",
-                            "diff",
-                            "--quiet",
-                            "main...feature/plan",
-                            "--",
-                            ".",
-                        ): flow.CommandResult(
-                            (
-                                "git",
-                                "diff",
-                                "--quiet",
-                                "main...feature/plan",
-                                "--",
-                                ".",
-                            ),
-                            repo,
-                            0,
-                        ),
-                    }
-                ),
-            )
-
-            with self.assertRaisesRegex(flow.FlowError, "no file changes"):
-                subject.require_implementation_invariants(repo, "feature/plan")
-
-    def test_implementation_fails_when_non_handoff_file_remains(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            repo = Path(temp) / "repo"
-            subject = flow.HarnessWorktreeFlow(
-                self.config(repo, repo / "plan.md"),
-                FakeRunner(
-                    {
-                        ("git", "rev-list", "--count", "main..feature/plan"): "1\n",
-                        (
-                            "git",
-                            "diff",
-                            "--quiet",
-                            "main...feature/plan",
-                            "--",
-                            ".",
-                        ): flow.CommandResult(
-                            (
-                                "git",
-                                "diff",
-                                "--quiet",
-                                "main...feature/plan",
-                                "--",
-                                ".",
-                            ),
-                            repo,
-                            1,
-                        ),
-                        (
-                            "git",
-                            "status",
-                            "--porcelain",
-                            "--untracked-files=all",
-                        ): "?? app.py\n?? .codex/handoff/implementation-summary.md\n",
-                    }
-                ),
-            )
-
-            with self.assertRaisesRegex(flow.FlowError, "non-handoff changes"):
-                subject.require_implementation_invariants(repo, "feature/plan")
-
-    def test_implementation_allows_untracked_handoff_files(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            repo = Path(temp) / "repo"
-            subject = flow.HarnessWorktreeFlow(
-                self.config(repo, repo / "plan.md"),
-                FakeRunner(
-                    {
-                        ("git", "rev-list", "--count", "main..feature/plan"): "1\n",
-                        (
-                            "git",
-                            "diff",
-                            "--quiet",
-                            "main...feature/plan",
-                            "--",
-                            ".",
-                        ): flow.CommandResult(
-                            (
-                                "git",
-                                "diff",
-                                "--quiet",
-                                "main...feature/plan",
-                                "--",
-                                ".",
-                            ),
-                            repo,
-                            1,
-                        ),
-                        (
-                            "git",
-                            "status",
-                            "--porcelain",
-                            "--untracked-files=all",
-                        ): "?? .codex/handoff/implementation-summary.md\n",
-                    }
-                ),
-            )
-
-            subject.require_implementation_invariants(repo, "feature/plan")
-
-    def test_audit_allows_no_new_commit_when_clean_outside_handoff(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            repo = Path(temp) / "repo"
-            subject = flow.HarnessWorktreeFlow(
-                self.config(repo, repo / "plan.md"),
-                FakeRunner(
-                    {
-                        (
-                            "git",
-                            "status",
-                            "--porcelain",
-                            "--untracked-files=all",
-                        ): "?? .codex/handoff/audit-summary.md\n",
-                        ("git", "rev-parse", "HEAD"): "before\n",
-                    }
-                ),
-            )
-
-            subject.require_audit_invariants(repo, "feature/plan", "before")
-
-    def test_audit_allows_new_commit_when_clean_outside_handoff(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            repo = Path(temp) / "repo"
-            subject = flow.HarnessWorktreeFlow(
-                self.config(repo, repo / "plan.md"),
-                FakeRunner(
-                    {
-                        (
-                            "git",
-                            "status",
-                            "--porcelain",
-                            "--untracked-files=all",
-                        ): "?? .codex/handoff/audit-summary.md\n",
-                        ("git", "rev-parse", "HEAD"): "after\n",
-                        (
-                            "git",
-                            "diff",
-                            "--quiet",
-                            "main...feature/plan",
-                            "--",
-                            ".",
-                        ): flow.CommandResult(
-                            (
-                                "git",
-                                "diff",
-                                "--quiet",
-                                "main...feature/plan",
-                                "--",
-                                ".",
-                            ),
-                            repo,
-                            1,
-                        ),
-                    }
-                ),
-            )
-
-            subject.require_audit_invariants(repo, "feature/plan", "before")
-
-    def test_audit_fails_when_non_handoff_changes_remain(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            repo = Path(temp) / "repo"
-            subject = flow.HarnessWorktreeFlow(
-                self.config(repo, repo / "plan.md"),
-                FakeRunner(
-                    {
-                        (
-                            "git",
-                            "status",
-                            "--porcelain",
-                            "--untracked-files=all",
-                        ): " M app.py\n",
-                    }
-                ),
-            )
-
-            with self.assertRaisesRegex(flow.FlowError, "non-handoff changes"):
-                subject.require_audit_invariants(repo, "feature/plan", "before")
-
-    def test_final_guard_fails_when_non_handoff_changes_appear_after_audit(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            repo = Path(temp) / "repo"
-            subject = flow.HarnessWorktreeFlow(
-                self.config(repo, repo / "plan.md"),
-                FakeRunner(
-                    {
-                        (
-                            "git",
-                            "ls-tree",
-                            "-r",
-                            "--name-only",
-                            "feature/plan",
-                            "--",
-                            ".codex/handoff",
-                        ): "",
-                        (
-                            "git",
-                            "status",
-                            "--porcelain",
-                            "--untracked-files=all",
-                        ): "?? leaked.txt\n",
-                    }
-                ),
-            )
-
-            with self.assertRaisesRegex(flow.FlowError, "Pre-integration"):
-                subject.require_ready_for_integration(repo, "feature/plan")
-
-    def test_handoff_prompts_forbid_committing_artifacts(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            repo = Path(temp) / "repo"
-            repo.mkdir()
-            runner = FakeRunner()
-            subject = flow.HarnessWorktreeFlow(self.config(repo, repo / "plan.md"), runner)
-
-            subject.run_implementation(repo, repo / "plan.md")
-            subject.run_audit(repo, repo / "plan.md")
-
-            prompts = [value for value in runner.inputs if value is not None]
-            self.assertIn("Do not commit files under `.codex/handoff/`", prompts[-2])
-            self.assertIn("Do not commit files under `.codex/handoff/`", prompts[-1])
-
-
-    def test_finish_stages_integration_changes_in_squash_mode(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            repo = Path(temp) / "repo"
-            feature = Path(temp) / "repo-plan"
-            plan = feature / "docs" / "plans" / "plan.md"
-            repo.mkdir()
-            plan.parent.mkdir(parents=True)
-            plan.write_text("# Plan", encoding="utf-8")
-            subject = flow.HarnessWorktreeFlow(self.config(repo, plan), FakeRunner())
-            subject.prepare_harness_permissions = lambda _path: None
-            events: list[str] = []
-            subject.stage_integration_changes = lambda _worktree: events.append("stage")
-            subject.has_staged_non_handoff_changes = lambda _worktree: True
-            subject.archive_handoff = lambda *_args: repo / ".codex" / "archive"
-            subject.update_workflow_state = lambda state, **changes: flow.replace(state, **changes)
-            subject.require_ready_for_integration = lambda _worktree, _branch: None
-
-            subject.finish(
-                repo,
-                self.workflow_state(feature, merge_mode=subject.config.merge_mode),
-                flow.Names("plan", "feature/plan", feature, "plan-run"),
-                plan,
-            )
-
-            self.assertEqual(events, ["stage"])
-
-
-
-    def test_no_ff_merge_uses_no_commit_and_workflow_commit(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            repo = Path(temp) / "repo"
-            feature = Path(temp) / "repo-plan"
-            plan = feature / "docs" / "plans" / "plan.md"
-            repo.mkdir()
-            plan.parent.mkdir(parents=True)
-            plan.write_text("# Plan", encoding="utf-8")
-            (feature / ".codex" / "handoff").mkdir(parents=True)
-            subject = flow.HarnessWorktreeFlow(
-                self.config(repo, plan, merge_mode="no-ff"), FakeRunner()
-            )
-            subject.prepare_harness_permissions = lambda _path: None
-            subject.stage_integration_changes = lambda _worktree: None
-            subject.has_staged_non_handoff_changes = lambda _worktree: True
-            subject.archive_handoff = lambda *_args: repo / ".codex" / "archive"
-            subject.update_workflow_state = lambda state, **changes: flow.replace(state, **changes)
-            subject.require_ready_for_integration = lambda _worktree, _branch: None
-
-            subject.finish(
-                repo,
-                self.workflow_state(feature, merge_mode=subject.config.merge_mode),
-                flow.Names("plan", "feature/plan", feature, "plan-run"),
-                plan,
-            )
-
-            calls = [call[0] for call in subject.runner.calls]
-            self.assertIn(("git", "merge", "--no-ff", "--no-commit", "feature/plan"), calls)
-            self.assertIn(("git", "commit", "-m", "Harness: Plan"), calls)
-            self.assertNotIn(("git", "merge", "--continue"), calls)
-
-
-
-    def test_conflict_runs_resolver_before_integration_stage(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            repo = Path(temp) / "repo"
-            feature = Path(temp) / "repo-plan"
-            plan = feature / "docs" / "plans" / "plan.md"
-            repo.mkdir()
-            plan.parent.mkdir(parents=True)
-            plan.write_text("# Plan", encoding="utf-8")
-            (feature / ".codex" / "handoff").mkdir(parents=True)
-            subject = flow.HarnessWorktreeFlow(
-                self.config(repo, plan),
-                FailingSquashMergeRunner(unmerged_paths="app.py\n"),
-            )
-            subject.prepare_harness_permissions = lambda _path: None
-            events: list[str] = []
-            subject.run_conflict_resolution = lambda *_args: events.append("resolve")
-            subject.stage_integration_changes = lambda _worktree: events.append("stage")
-            subject.archive_handoff = lambda *_args: repo / ".codex" / "archive"
-            unmerged_checks = iter([False, True, False, False])
-            subject.has_unmerged_paths = lambda _worktree: next(unmerged_checks)
-            subject.has_staged_non_handoff_changes = lambda _worktree: True
-            subject.update_workflow_state = lambda state, **changes: flow.replace(state, **changes)
-            subject.require_ready_for_integration = lambda _worktree, _branch: None
-
-            subject.finish(
-                repo,
-                self.workflow_state(feature, merge_mode=subject.config.merge_mode),
-                flow.Names("plan", "feature/plan", feature, "plan-run"),
-                plan,
-            )
-
-            self.assertEqual(events, ["resolve", "stage"])
-
-    def test_plan_outside_repo_is_copied(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            repo = Path(temp) / "repo"
-            worktree = Path(temp) / "repo-feature"
-            plan = Path(temp) / "external.md"
-            repo.mkdir()
-            worktree.mkdir()
-            plan.write_text("# External", encoding="utf-8")
-            names = flow.Names(
-                "external",
-                "feature/external",
-                worktree,
-                "20260629-082455-external",
-            )
-            actual = flow.HarnessWorktreeFlow(
-                self.config(repo, plan), FakeRunner()
-            ).ensure_plan_in_worktree(repo, plan, worktree, names)
-            self.assertEqual(
-                actual,
-                worktree
-                / ".codex"
-                / "worktree-flow"
-                / "20260629-082455-external"
-                / "plan.md",
-            )
-            self.assertEqual(actual.read_text(encoding="utf-8"), "# External")
-
-    def test_harness_command_includes_model_and_output_file(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            repo = Path(temp) / "repo"
-            plan = repo / "plan.md"
-            config = self.config(repo, plan, model="gpt-5")
-            runner = FakeRunner()
-            subject = flow.HarnessWorktreeFlow(config, runner)
-            subject.omp_sessions_roots = lambda _repo: []
-            subject.harness_exec(repo, "Prompt", repo / "out.md", phase="implementation")
-            args = runner.calls[-1][0]
-            self.assertEqual(args[:2], ("codex", "exec"))
-            self.assertIn("--model", args)
-            self.assertIn("gpt-5", args)
-            self.assertEqual(args[-1], "-")
-            self.assertEqual(runner.inputs[-1], "Prompt")
-            self.assertIn("--output-last-message", args)
-
-    def test_harness_exec_logs_jsonl_to_main_repo_archive(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            repo = Path(temp) / "repo"
-            worktree = Path(temp) / "repo-feature"
-            repo.mkdir()
-            worktree.mkdir()
-            output_file = worktree / ".codex" / "handoff" / "implementation-final-response.md"
-            subject = flow.HarnessWorktreeFlow(self.config(repo, repo / "plan.md"), FakeRunner())
-            subject.omp_sessions_roots = lambda _repo: []
-
-            subject.start_log(repo, "plan-run")
-            subject.harness_exec(worktree, "Secret prompt", output_file, phase="implementation")
-
-            log_file = repo / ".codex" / "handoff" / "workflow.jsonl"
-            records = [
-                json.loads(line)
-                for line in log_file.read_text(encoding="utf-8").splitlines()
-            ]
-            self.assertEqual(log_file, subject.log_file)
-            self.assertEqual(
-                [record["event"] for record in records],
-                [
-                    "workflow_log_started",
-                    "harness_exec_start",
-                    "harness_exec_finish",
-                ],
-            )
-            self.assertEqual(records[1]["cwd"], str(worktree))
-            self.assertNotIn("Secret prompt", records[1]["command"])
-            self.assertFalse(records[2]["output_file_exists"])
-            self.assertEqual(records[2]["returncode"], 0)
-            self.assertIn("duration_ms", records[2])
-            self.assertIn("timed_out", records[2])
-            self.assertIn("started_at", records[2])
-            self.assertIn("finished_at", records[2])
-            self.assertEqual(
-                records[2]["stdout"],
-                {"text": "", "truncated": False, "original_chars": 0},
-            )
-            self.assertEqual(
-                records[2]["stderr"],
-                {"text": "", "truncated": False, "original_chars": 0},
-            )
-
-    def test_failing_harness_exec_logs_failure_without_prompt_and_bounds_output(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            repo = Path(temp) / "repo"
-            worktree = Path(temp) / "repo-feature"
-            repo.mkdir()
-            worktree.mkdir()
-            output_file = worktree / ".codex" / "handoff" / "implementation-final-response.md"
-            stdout = "x" * (flow.MAX_LOG_OUTPUT_CHARS + 5)
-            runner = FailingHarnessExecRunner(stdout=stdout, stderr="failed")
-            subject = flow.HarnessWorktreeFlow(self.config(repo, repo / "plan.md"), runner)
-            subject.omp_sessions_roots = lambda _repo: []
-
-            subject.start_log(repo, "plan-run")
-            with self.assertRaisesRegex(flow.FlowError, "exit code 42"):
-                subject.harness_exec(worktree, "Secret prompt", output_file, phase="implementation")
-
-            log_file = repo / ".codex" / "handoff" / "workflow.jsonl"
-            records = [
-                json.loads(line)
-                for line in log_file.read_text(encoding="utf-8").splitlines()
-            ]
-            self.assertEqual(
-                [record["event"] for record in records],
-                [
-                    "workflow_log_started",
-                    "harness_exec_start",
-                    "harness_exec_finish",
-                    "harness_exec_failure",
-                ],
-            )
-            failure = records[3]
-            self.assertNotIn("Secret prompt", json.dumps(records, ensure_ascii=False))
-            self.assertNotIn("-", failure["command"])
-            self.assertEqual(failure["returncode"], 42)
-            self.assertFalse(failure["timed_out"])
-            self.assertEqual(failure["duration_ms"], 123)
-            self.assertTrue(failure["stdout"]["truncated"])
-            self.assertEqual(failure["stdout"]["original_chars"], len(stdout))
-            self.assertEqual(len(failure["stdout"]["text"]), flow.MAX_LOG_OUTPUT_CHARS)
-            self.assertEqual(
-                failure["stderr"],
-                {"text": "failed", "truncated": False, "original_chars": 6},
-            )
-
-    def test_timed_out_harness_exec_logs_timeout_failure(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            repo = Path(temp) / "repo"
-            worktree = Path(temp) / "repo-feature"
-            repo.mkdir()
-            worktree.mkdir()
-            output_file = worktree / ".codex" / "handoff" / "implementation-final-response.md"
-            runner = FailingHarnessExecRunner(
-                stdout="partial",
-                stderr="timeout",
-                returncode=-9,
-                timed_out=True,
-            )
-            subject = flow.HarnessWorktreeFlow(self.config(repo, repo / "plan.md"), runner)
-            subject.omp_sessions_roots = lambda _repo: []
-
-            subject.start_log(repo, "plan-run")
-            with self.assertRaisesRegex(flow.FlowError, "Command timed out"):
-                subject.harness_exec(worktree, "Secret prompt", output_file, phase="implementation")
-
-            log_file = repo / ".codex" / "handoff" / "workflow.jsonl"
-            records = [
-                json.loads(line)
-                for line in log_file.read_text(encoding="utf-8").splitlines()
-            ]
-            failure = records[-1]
-            self.assertEqual(failure["event"], "harness_exec_failure")
-            self.assertTrue(failure["timed_out"])
-            self.assertEqual(failure["returncode"], -9)
-            self.assertEqual(failure["stdout"]["text"], "partial")
-            self.assertNotIn("Secret prompt", json.dumps(records, ensure_ascii=False))
-
-    def test_collects_omp_usage_stats_split_by_phase_without_text(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            repo = Path(temp) / "repo"
-            worktree = Path(temp) / "repo-feature"
-            sessions_root = Path(temp) / "sessions"
-            repo.mkdir()
-            worktree.mkdir()
-            sessions_root.mkdir()
-            subject = flow.HarnessWorktreeFlow(
-                self.omp_config(repo, repo / "plan.md"), FakeRunner()
-            )
-            subject.omp_sessions_roots = lambda _repo: [sessions_root]
-            impl_session = sessions_root / "implementation.jsonl"
-            audit_session = sessions_root / "audit.jsonl"
-            secret_path = worktree / "secret-input.txt"
-            prompt_text = "PROMPT_TEXT_SHOULD_NOT_LEAK"
-            display_text = "DISPLAY_TEXT_SHOULD_NOT_LEAK"
-            answer_text = "ANSWER_TEXT_SHOULD_NOT_LEAK"
-
-            impl_snapshot = subject.snapshot_omp_sessions(repo)
-            self.write_jsonl_file(
-                impl_session,
-                [
-                    {"type": "session", "sessionId": "impl-session", "cwd": str(worktree)},
-                    {"type": "model_change", "model_change": {"model": "gpt-5.5"}},
-                    {
-                        "id": "impl-assistant",
-                        "type": "message",
-                        "message": {
-                            "role": "assistant",
-                            "api": "responses",
-                            "provider": "openai-codex",
-                            "model": "gpt-5.5",
-                            "stopReason": "stop",
-                            "content": prompt_text,
-                            "usage": {
-                                "input": 10,
-                                "output": 4,
-                                "cacheRead": 3,
-                                "cacheWrite": 2,
-                                "reasoningTokens": 1,
-                                "totalTokens": 20,
-                                "cost": {
-                                    "input": 0.01,
-                                    "output": 0.02,
-                                    "cacheRead": 0.03,
-                                    "cacheWrite": 0.04,
-                                    "total": 0.12,
-                                },
-                            },
-                            "duration": 1.5,
-                            "ttft": 0.2,
-                            "contextSnapshot": {
-                                "promptTokens": 100,
-                                "nonMessageTokens": 25,
-                            },
-                            "details": {
-                                "displayContent": display_text,
-                                "response": {
-                                    "answer": answer_text,
-                                    "usage": {
-                                        "inputTokens": 7,
-                                        "outputTokens": 8,
-                                        "totalTokens": 15,
-                                    },
-                                },
-                                "files": [str(secret_path)],
-                                "url": "https://example.invalid/secret-response",
-                            },
-                        },
-                    },
-                ],
-            )
-            impl_event = subject.collect_phase_usage(
-                repo,
-                worktree,
-                "implementation",
-                impl_snapshot,
-                flow.CommandResult(
-                    ("omp", "-p"),
-                    worktree,
-                    0,
-                    started_at="impl-start",
-                    finished_at="impl-finish",
-                    duration_ms=1500,
-                ),
-            )
-            subject.append_usage_event(worktree, impl_event)
-            subject.rewrite_usage_summary(worktree)
-            subject.rewrite_usage_sources(worktree)
-
-            audit_snapshot = subject.snapshot_omp_sessions(repo)
-            self.write_jsonl_file(
-                audit_session,
-                [
-                    {"type": "session", "sessionId": "audit-session", "cwd": str(worktree)},
-                    {
-                        "id": "audit-assistant",
-                        "type": "message",
-                        "message": {
-                            "role": "assistant",
-                            "provider": "openai-codex",
-                            "model": "gpt-5.5",
-                            "usage": {
-                                "input": 2,
-                                "output": 3,
-                                "totalTokens": 5,
-                            },
-                            "details": {"displayContent": display_text},
-                        },
-                    },
-                    {
-                        "id": "audit-read-start",
-                        "type": "custom",
-                        "customType": "tool_execution_start",
-                        "data": {
-                            "toolName": "read",
-                            "args": {"path": str(secret_path)},
-                        },
-                    },
-                    {
-                        "id": "audit-read-result",
-                        "type": "message",
-                        "message": {
-                            "role": "toolResult",
-                            "toolName": "read",
-                            "isError": False,
-                            "details": {
-                                "wallTimeMs": 12,
-                                "fileCount": 2,
-                                "matchCount": 4,
-                                "fileLimitReached": True,
-                                "resultLimitReached": True,
-                                "displayContent": display_text,
-                                "stdout": "STDOUT_SHOULD_NOT_LEAK",
-                                "stderr": "STDERR_SHOULD_NOT_LEAK",
-                                "url": "https://example.invalid/tool-result",
-                            },
-                        },
-                    },
-                ],
-            )
-            audit_event = subject.collect_phase_usage(
-                repo,
-                worktree,
-                "audit",
-                audit_snapshot,
-                flow.CommandResult(
-                    ("omp", "-p"),
-                    worktree,
-                    0,
-                    started_at="audit-start",
-                    finished_at="audit-finish",
-                    duration_ms=2500,
-                ),
-            )
-            subject.append_usage_event(worktree, audit_event)
-            subject.rewrite_usage_summary(worktree)
-            subject.rewrite_usage_sources(worktree)
-
-            handoff = worktree / ".omp" / "handoff"
-            events = self.read_jsonl_file(handoff / "usage-events.jsonl")
-            summary = self.read_json_file(handoff / "usage-summary.json")
-            sources_payload = self.read_json_file(handoff / "usage-sources.json")
-            sources = sources_payload["sources"]
-            self.assertEqual([event["phase"] for event in events], ["implementation", "audit"])
-            self.assertEqual(events[0]["status"], "collected")
-            self.assertEqual(events[0]["command_returncode"], 0)
-            self.assertFalse(events[0]["command_timed_out"])
-            self.assertEqual(events[0]["command_duration_ms"], 1500)
-            self.assertEqual(events[0]["nested_response_usage"]["total_tokens"], 15)
-            self.assertEqual(events[0]["context"]["max_prompt_tokens"], 100)
-            self.assertEqual(events[0]["context"]["last_non_message_tokens"], 25)
-            self.assertEqual(events[1]["event_counts"]["tool_execution_start"], 1)
-            self.assertEqual(events[1]["tools"]["read"]["results"], 1)
-            self.assertEqual(events[1]["tools"]["read"]["wall_time_ms"], 12)
-            self.assertEqual(events[1]["tools"]["read"]["file_count"], 2)
-            self.assertEqual(events[1]["tools"]["read"]["match_count"], 4)
-            self.assertEqual(events[1]["tools"]["read"]["file_limit_reached"], 1)
-            self.assertEqual(events[1]["tools"]["read"]["result_limit_reached"], 1)
-            self.assertEqual(summary["schema_version"], 1)
-            self.assertEqual(summary["phases"]["implementation"]["runs"], 1)
-            self.assertEqual(
-                summary["phases"]["implementation"]["status_counts"]["collected"],
-                1,
-            )
-            self.assertEqual(
-                summary["phases"]["implementation"]["totals"]["total_tokens"],
-                20,
-            )
-            self.assertEqual(summary["phases"]["implementation"]["totals"]["input_tokens"], 10)
-            self.assertEqual(summary["phases"]["implementation"]["totals"]["cost_total"], 0.12)
-            self.assertEqual(summary["phases"]["audit"]["totals"]["total_tokens"], 5)
-            self.assertEqual(summary["phases"]["audit"]["tools"]["read"]["calls"], 1)
-            self.assertEqual(summary["phases"]["audit"]["tools"]["read"]["results"], 1)
-            self.assertEqual(summary["phases"]["audit"]["tools"]["read"]["wall_time_ms"], 12)
-            self.assertEqual(summary["phases"]["audit"]["tools"]["read"]["file_count"], 2)
-            self.assertEqual(summary["totals"]["total_tokens"], 25)
-            self.assertEqual(summary["tools"]["read"]["calls"], 1)
-            self.assertEqual(summary["sources"]["count"], 2)
-            self.assertEqual(len(summary["sources"]["path_hashes"]), 2)
-            self.assertEqual(
-                summary["privacy"],
-                {
-                    "prompt_text_logged": False,
-                    "response_text_logged": False,
-                    "tool_argument_values_logged": False,
-                    "session_paths_logged": False,
-                },
-            )
-            self.assertIsInstance(sources, list)
-            sources_by_file = {source["file_name"]: source for source in sources}
-            self.assertEqual(set(sources_by_file), {"implementation.jsonl", "audit.jsonl"})
-            self.assertEqual(sources_by_file["implementation.jsonl"]["session_id"], "impl-session")
-            self.assertRegex(
-                sources_by_file["implementation.jsonl"]["path_hash"],
-                r"^[0-9a-f]{16}$",
-            )
-            self.assertEqual(
-                sources_by_file["implementation.jsonl"]["event_counts"]["message"],
-                1,
-            )
-            self.assertIn(
-                "impl-assistant",
-                sources_by_file["implementation.jsonl"]["record_ids"],
-            )
-            for source in sources:
-                self.assertNotIn("path", source)
-                self.assertNotIn("cwd", source)
-
-            serialized = self.usage_artifacts_text(handoff)
-            for leaked in (
-                prompt_text,
-                display_text,
-                answer_text,
-                str(secret_path),
-                str(impl_session),
-                str(audit_session),
-                "https://example.invalid/secret-response",
-                "STDOUT_SHOULD_NOT_LEAK",
-                "STDERR_SHOULD_NOT_LEAK",
-                "https://example.invalid/tool-result",
-            ):
-                self.assertNotIn(leaked, serialized)
-
-    def test_harness_exec_writes_usage_artifacts_on_failure(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            repo = Path(temp) / "repo"
-            worktree = Path(temp) / "repo-feature"
-            sessions_root = Path(temp) / "sessions"
-            repo.mkdir()
-            worktree.mkdir()
-            sessions_root.mkdir()
-            output_file = worktree / ".omp" / "handoff" / "implementation-final-response.md"
-            session_file = sessions_root / "failure.jsonl"
-
-            def write_failure_session() -> None:
-                self.write_jsonl_file(
-                    session_file,
-                    [
-                        {"type": "session", "sessionId": "failure-session", "cwd": str(worktree)},
-                        {
-                            "id": "failure-assistant",
-                            "type": "message",
-                            "message": {
-                                "role": "assistant",
-                                "provider": "openai-codex",
-                                "model": "gpt-5.5",
-                                "usage": {
-                                    "input": 6,
-                                    "output": 3,
-                                    "totalTokens": 9,
-                                },
-                            },
-                        },
-                    ],
-                )
-
-            class UsageWritingFailingRunner(FailingHarnessExecRunner):
-                def run(self, args, cwd, *, check=True, capture=True, input_text=None):
-                    if tuple(args[:2]) == ("omp", "-p"):
-                        write_failure_session()
-                    return super().run(
-                        args,
-                        cwd,
-                        check=check,
-                        capture=capture,
-                        input_text=input_text,
-                    )
-
-            runner = UsageWritingFailingRunner(
-                stdout="FAILED_STDOUT_SHOULD_NOT_LEAK",
-                stderr="FAILED_STDERR_SHOULD_NOT_LEAK",
-            )
-            subject = flow.HarnessWorktreeFlow(
-                self.omp_config(repo, repo / "plan.md"), runner
-            )
-            subject.omp_sessions_roots = lambda _repo: [sessions_root]
-
-            with self.assertRaisesRegex(flow.FlowError, "exit code 42"):
-                subject.harness_exec(
-                    worktree,
-                    "FAILURE_PROMPT_SHOULD_NOT_LEAK",
-                    output_file,
-                    phase="implementation",
-                )
-
-            handoff = worktree / ".omp" / "handoff"
-            for name in (
-                "usage-events.jsonl",
-                "usage-summary.json",
-                "usage-sources.json",
-            ):
-                self.assertTrue((handoff / name).exists(), name)
-            events = self.read_jsonl_file(handoff / "usage-events.jsonl")
-            summary = self.read_json_file(handoff / "usage-summary.json")
-            self.assertEqual(events[0]["phase"], "implementation")
-            self.assertEqual(events[0]["status"], "collected")
-            self.assertEqual(events[0]["command_returncode"], 42)
-            self.assertFalse(events[0]["command_timed_out"])
-            self.assertEqual(events[0]["command_duration_ms"], 123)
-            self.assertEqual(summary["phases"]["implementation"]["totals"]["total_tokens"], 9)
-            self.assertEqual(
-                summary["phases"]["implementation"]["status_counts"]["collected"],
-                1,
-            )
-            serialized = self.usage_artifacts_text(handoff)
-            for leaked in (
-                "FAILURE_PROMPT_SHOULD_NOT_LEAK",
-                "FAILED_STDOUT_SHOULD_NOT_LEAK",
-                "FAILED_STDERR_SHOULD_NOT_LEAK",
-                str(output_file.with_name("implementation-final-response-prompt.md")),
-                str(session_file),
-            ):
-                self.assertNotIn(leaked, serialized)
-
-    def test_non_omp_harness_records_unavailable_usage_event(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            repo = Path(temp) / "repo"
-            worktree = Path(temp) / "repo-feature"
-            fake_sessions_root = Path(temp) / "unused-sessions"
-            repo.mkdir()
-            worktree.mkdir()
-            fake_sessions_root.mkdir()
-            output_file = worktree / ".codex" / "handoff" / "implementation-final-response.md"
-            subject = flow.HarnessWorktreeFlow(self.config(repo, repo / "plan.md"), FakeRunner())
-            subject.omp_sessions_roots = lambda _repo: [fake_sessions_root]
-
-            subject.harness_exec(
-                worktree,
-                "NON_OMP_PROMPT_SHOULD_NOT_LEAK",
-                output_file,
-                phase="implementation",
-            )
-
-            handoff = worktree / ".codex" / "handoff"
-            events = self.read_jsonl_file(handoff / "usage-events.jsonl")
-            summary = self.read_json_file(handoff / "usage-summary.json")
-            self.assertEqual(len(events), 1)
-            self.assertEqual(events[0]["phase"], "implementation")
-            self.assertEqual(events[0]["status"], "unavailable")
-            self.assertEqual(events[0]["reason"], "non_omp_harness")
-            self.assertEqual(events[0]["command_returncode"], 0)
-            self.assertFalse(events[0]["command_timed_out"])
-            self.assertEqual(summary["schema_version"], 1)
-            self.assertEqual(
-                summary["phases"]["implementation"]["status_counts"]["unavailable"],
-                1,
-            )
-            self.assertTrue(all(value is False for value in summary["privacy"].values()))
-            self.assertNotIn("NON_OMP_PROMPT_SHOULD_NOT_LEAK", self.usage_artifacts_text(handoff))
-
-    def test_stop_merge_mode_does_not_finish(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            repo = Path(temp) / "repo"
-            worktree = Path(temp) / "repo-plan"
-            plan = repo / "docs" / "plans" / "plan.md"
-            repo.mkdir()
-            (worktree / "docs" / "plans").mkdir(parents=True)
-            plan.parent.mkdir(parents=True)
-            plan.write_text("# Plan", encoding="utf-8")
-            (worktree / "docs" / "plans" / "plan.md").write_text("# Plan", encoding="utf-8")
-            handoff = worktree / ".codex" / "handoff"
-            handoff.mkdir(parents=True)
-            (handoff / "implementation-summary.md").write_text("impl", encoding="utf-8")
-            (handoff / "audit-summary.md").write_text("audit", encoding="utf-8")
-
-            runner = FakeRunner(
-                {
-                    ("git", "branch", "--list", "feature/plan"): "",
-                }
-            )
-            config = self.config(repo, plan, merge_mode="stop")
-            subject = flow.HarnessWorktreeFlow(config, runner)
-            subject.create_feature_worktree = lambda _repo, _names: None
-            subject.run_implementation = lambda _worktree, _plan: None
-            subject.run_audit = lambda _worktree, _plan: None
-            subject.require_implementation_invariants = lambda _worktree, _branch: None
-            subject.head_rev = lambda _worktree: "before"
-            subject.require_audit_invariants = lambda _worktree, _branch, _head: None
-            subject.require_commits_since_base = lambda *_args: None
-            subject.require_branch_changed_since_base = lambda *_args: None
-            subject.require_ready_for_integration = lambda _worktree, _branch: None
-            subject.unique_feature_names = lambda _repo, _slug, _run_id=None: flow.Names("plan", "feature/plan", worktree, "plan-run")
-            subject.validate = lambda _repo, _plan: None
-            subject.finish = lambda *_args: (_ for _ in ()).throw(AssertionError("finish should not run"))
-
-            subject.run()
-
-    def test_checked_command_failure_after_log_is_recorded(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            repo = Path(temp) / "repo"
-            worktree = Path(temp) / "repo-plan"
-            plan = repo / "docs" / "plans" / "plan.md"
-            repo.mkdir()
-            worktree.mkdir()
-            plan.parent.mkdir(parents=True)
-            plan.write_text("# Plan", encoding="utf-8")
-            result = flow.CommandResult(
-                ("git", "commit", "-m", "Harness: Plan"),
-                repo,
-                -9,
-                "partial",
-                "timeout",
-                started_at="start",
-                finished_at="finish",
-                duration_ms=1000,
-                timed_out=True,
-            )
-            runner = FakeRunner()
-            subject = flow.HarnessWorktreeFlow(self.config(repo, plan), runner)
-            subject.create_feature_worktree = lambda _repo, _names: None
-            subject.ensure_plan_in_worktree = lambda *_args: plan
-            subject.run_implementation = lambda *_args: None
-            subject.require_file = lambda _path: None
-            subject.require_no_tracked_handoff_artifacts = lambda *_args: None
-            subject.require_implementation_invariants = lambda *_args: None
-            subject.head_rev = lambda _worktree: "before"
-            subject.run_audit = lambda *_args: None
-            subject.require_audit_invariants = lambda *_args: None
-            subject.archive_handoff = lambda *_args: repo / ".codex" / "archive"
-            subject.require_ready_for_integration = lambda *_args: None
-            subject.unique_feature_names = lambda _repo, _slug, _run_id=None: flow.Names(
-                "plan", "feature/plan", worktree, "plan-run"
-            )
-            subject.validate = lambda _repo, _plan: None
-            subject.finish = lambda *_args: (_ for _ in ()).throw(
-                flow.CommandFailureError(result)
-            )
-
-            with self.assertRaisesRegex(flow.CommandFailureError, "Command timed out"):
-                subject.run()
-
-            log_file = worktree / ".codex" / "handoff" / "workflow.jsonl"
-            records = [
-                json.loads(line)
-                for line in log_file.read_text(encoding="utf-8").splitlines()
-            ]
-            failures = [
-                record for record in records if record["event"] == "command_failure"
-            ]
-            self.assertEqual(len(failures), 1)
-            self.assertEqual(failures[0]["phase"], "workflow")
-            self.assertEqual(failures[0]["step"], "checked_command")
-            self.assertTrue(failures[0]["timed_out"])
-
-    def test_conflict_context_contains_files_and_rules(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            repo = Path(temp) / "repo"
-            plan = repo / "plan.md"
-            runner = FakeRunner(
-                {
-                    ("git", "status", "--short"): "UU app.py\n",
-                    ("git", "diff", "--name-only", "--diff-filter=U"): "app.py\n",
-                    ("git", "merge-base", "main", "feature/plan"): "abc123\n",
-                    ("git", "log", "--oneline", "abc123..main"): "base commit\n",
-                    ("git", "log", "--oneline", "abc123..feature/plan"): "feature commit\n",
-                }
-            )
-            text = flow.HarnessWorktreeFlow(self.config(repo, plan), runner).conflict_context(
-                repo,
-                flow.Names("plan", "feature/plan", repo, "plan-run"),
-                plan,
-            )
-            self.assertIn("app.py", text)
-            self.assertIn("Latest base behavior is presumed correct", text)
-            self.assertIn("feature commit", text)
-
-    def test_post_conflict_audit_prompt_does_not_allow_commit(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            repo = Path(temp) / "repo"
-            repo.mkdir()
-            runner = FakeRunner()
-            flow.HarnessWorktreeFlow(self.config(repo, repo / "plan.md"), runner).run_audit(
-                repo,
-                repo / "plan.md",
-                post_conflict=True,
-            )
-            prompt = runner.inputs[-1]
-            self.assertIn("Do not commit", prompt)
-            self.assertNotIn("commit audit fixes if changes are made", prompt.lower())
-
-    def test_cleanup_forces_prunes_and_removes_remaining_directories(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            repo = Path(temp) / "repo"
-            feature = Path(temp) / "repo-plan"
-            integration = Path(temp) / "repo-integrate-plan-run"
-            repo.mkdir()
-            feature.mkdir()
-            integration.mkdir()
-            runner = FakeRunner()
-            subject = flow.HarnessWorktreeFlow(
-                self.config(repo, feature / "docs" / "plans" / "plan.md"), runner
-            )
-
-            subject.cleanup(
-                repo,
-                integration,
-                "integration/plan-run",
-                flow.Names("plan", "feature/plan", feature, "plan-run"),
-            )
-
-            self.assertFalse(integration.exists())
-            self.assertFalse(feature.exists())
-            self.assertIn(
-                (
-                    ("git", "worktree", "remove", "--force", str(integration)),
-                    repo,
-                    False,
-                ),
-                runner.calls,
-            )
-            self.assertIn(
-                (
-                    ("git", "worktree", "remove", "--force", str(feature)),
-                    repo,
-                    False,
-                ),
-                runner.calls,
-            )
-            self.assertIn((("git", "worktree", "prune"), repo, False), runner.calls)
-
-    def test_finish_does_not_cleanup_if_primary_merge_fails(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            repo = Path(temp) / "repo"
-            feature = Path(temp) / "repo-plan"
-            plan = feature / "docs" / "plans" / "plan.md"
-            repo.mkdir()
-            plan.parent.mkdir(parents=True)
-            plan.write_text("# Plan", encoding="utf-8")
-            handoff = feature / ".codex" / "handoff"
-            handoff.mkdir(parents=True)
-            (handoff / "implementation-summary.md").write_text("impl", encoding="utf-8")
-            (handoff / "audit-summary.md").write_text("audit", encoding="utf-8")
-
-            subject = flow.HarnessWorktreeFlow(self.config(repo, plan), FailingFastForwardRunner())
-            subject.cleanup = lambda *_args: (_ for _ in ()).throw(AssertionError("cleanup should not run"))
-            subject.archive_handoff = lambda *_args: repo / ".codex" / "archive"
-            subject.prepare_harness_permissions = lambda _path: None
-            subject.require_ready_for_integration = lambda _worktree, _branch: None
-            subject.has_staged_non_handoff_changes = lambda _worktree: True
-            subject.base_contains_branch = lambda _repo, _branch: False
-            subject.start_log(repo, "plan-run")
-
-            with self.assertRaises(flow.FlowError):
-                subject.finish(
-                    repo,
-                    self.workflow_state(feature, merge_mode=subject.config.merge_mode),
-                    flow.Names("plan", "feature/plan", feature, "plan-run"),
-                    plan,
-                )
-
-            log_file = subject.log_file
-            records = [
-                json.loads(line)
-                for line in log_file.read_text(encoding="utf-8").splitlines()
-            ]
-            failures = [
-                record for record in records if record["event"] == "command_failure"
-            ]
-            self.assertEqual(len(failures), 1)
-            self.assertEqual(failures[0]["step"], "fast_forward_merge")
-
-    def test_non_conflict_squash_merge_failure_does_not_run_resolver(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            repo = Path(temp) / "repo"
-            feature = Path(temp) / "repo-plan"
-            plan = feature / "docs" / "plans" / "plan.md"
-            repo.mkdir()
-            plan.parent.mkdir(parents=True)
-            plan.write_text("# Plan", encoding="utf-8")
-            handoff = feature / ".codex" / "handoff"
-            handoff.mkdir(parents=True)
-            (handoff / "implementation-summary.md").write_text("impl", encoding="utf-8")
-            (handoff / "audit-summary.md").write_text("audit", encoding="utf-8")
-            subject = flow.HarnessWorktreeFlow(
-                self.config(repo, plan), FailingSquashMergeRunner(unmerged_paths="")
-            )
-            subject.prepare_harness_permissions = lambda _path: None
-            subject.run_conflict_resolution = lambda *_args: (_ for _ in ()).throw(
-                AssertionError("resolver should not run")
-            )
-            subject.require_ready_for_integration = lambda _worktree, _branch: None
-
-            subject.start_log(repo, "plan-run")
-            with self.assertRaisesRegex(flow.FlowError, "merge --squash"):
-                subject.finish(
-                    repo,
-                    self.workflow_state(feature, merge_mode=subject.config.merge_mode),
-                    flow.Names("plan", "feature/plan", feature, "plan-run"),
-                    plan,
-                )
-
-            log_file = subject.log_file
-            records = [
-                json.loads(line)
-                for line in log_file.read_text(encoding="utf-8").splitlines()
-            ]
-            failures = [
-                record for record in records if record["event"] == "command_failure"
-            ]
-            self.assertEqual(len(failures), 1)
-            self.assertEqual(failures[0]["step"], "squash_merge")
-            self.assertEqual(failures[0]["returncode"], 1)
-
-    def test_timed_out_squash_merge_aborts_without_resolver(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            repo = Path(temp) / "repo"
-            feature = Path(temp) / "repo-plan"
-            plan = feature / "docs" / "plans" / "plan.md"
-            repo.mkdir()
-            plan.parent.mkdir(parents=True)
-            plan.write_text("# Plan", encoding="utf-8")
-            handoff = feature / ".codex" / "handoff"
-            handoff.mkdir(parents=True)
-            (handoff / "implementation-summary.md").write_text("impl", encoding="utf-8")
-            (handoff / "audit-summary.md").write_text("audit", encoding="utf-8")
-            subject = flow.HarnessWorktreeFlow(
-                self.config(repo, plan),
-                FailingSquashMergeRunner(unmerged_paths="app.py\n", timed_out=True),
-            )
-            subject.prepare_harness_permissions = lambda _path: None
-            subject.run_conflict_resolution = lambda *_args: (_ for _ in ()).throw(
-                AssertionError("resolver should not run after a timeout")
-            )
-            subject.require_ready_for_integration = lambda _worktree, _branch: None
-            subject.has_unmerged_paths = lambda _worktree: False
-
-            subject.start_log(repo, "plan-run")
-            with self.assertRaisesRegex(flow.FlowError, "Command timed out"):
-                subject.finish(
-                    repo,
-                    self.workflow_state(feature, merge_mode=subject.config.merge_mode),
-                    flow.Names("plan", "feature/plan", feature, "plan-run"),
-                    plan,
-                )
-
-            log_file = subject.log_file
-            records = [
-                json.loads(line)
-                for line in log_file.read_text(encoding="utf-8").splitlines()
-            ]
-            failures = [
-                record for record in records if record["event"] == "command_failure"
-            ]
-            self.assertEqual(len(failures), 1)
-            self.assertEqual(failures[0]["step"], "squash_merge")
-            self.assertTrue(failures[0]["timed_out"])
-
-    def test_timed_out_no_ff_merge_aborts_without_resolver(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            repo = Path(temp) / "repo"
-            feature = Path(temp) / "repo-plan"
-            plan = feature / "docs" / "plans" / "plan.md"
-            repo.mkdir()
-            plan.parent.mkdir(parents=True)
-            plan.write_text("# Plan", encoding="utf-8")
-            handoff = feature / ".codex" / "handoff"
-            handoff.mkdir(parents=True)
-            (handoff / "implementation-summary.md").write_text("impl", encoding="utf-8")
-            (handoff / "audit-summary.md").write_text("audit", encoding="utf-8")
-            subject = flow.HarnessWorktreeFlow(
-                self.config(repo, plan, merge_mode="no-ff"),
-                FailingNoFfMergeRunner(unmerged_paths="app.py\n", timed_out=True),
-            )
-            subject.prepare_harness_permissions = lambda _path: None
-            subject.run_conflict_resolution = lambda *_args: (_ for _ in ()).throw(
-                AssertionError("resolver should not run after a timeout")
-            )
-            subject.require_ready_for_integration = lambda _worktree, _branch: None
-            subject.has_unmerged_paths = lambda _worktree: False
-
-            subject.start_log(repo, "plan-run")
-            with self.assertRaisesRegex(flow.FlowError, "Command timed out"):
-                subject.finish(
-                    repo,
-                    self.workflow_state(feature, merge_mode=subject.config.merge_mode),
-                    flow.Names("plan", "feature/plan", feature, "plan-run"),
-                    plan,
-                )
-
-            log_file = subject.log_file
-            records = [
-                json.loads(line)
-                for line in log_file.read_text(encoding="utf-8").splitlines()
-            ]
-            failures = [
-                record for record in records if record["event"] == "command_failure"
-            ]
-            self.assertEqual(len(failures), 1)
-            self.assertEqual(failures[0]["step"], "no_ff_merge")
-            self.assertTrue(failures[0]["timed_out"])
-
-    def test_conflict_squash_merge_failure_runs_resolver(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            repo = Path(temp) / "repo"
-            feature = Path(temp) / "repo-plan"
-            plan = feature / "docs" / "plans" / "plan.md"
-            repo.mkdir()
-            plan.parent.mkdir(parents=True)
-            plan.write_text("# Plan", encoding="utf-8")
-            handoff = feature / ".codex" / "handoff"
-            handoff.mkdir(parents=True)
-            (handoff / "implementation-summary.md").write_text("impl", encoding="utf-8")
-            (handoff / "audit-summary.md").write_text("audit", encoding="utf-8")
-            subject = flow.HarnessWorktreeFlow(
-                self.config(repo, plan), FailingSquashMergeRunner(unmerged_paths="app.py\n")
-            )
-            resolved = []
-            subject.prepare_harness_permissions = lambda _path: None
-            subject.run_conflict_resolution = lambda *_args: resolved.append(True)
-            unmerged_checks = iter([False, True, False, False])
-            subject.has_unmerged_paths = lambda _worktree: next(unmerged_checks)
-            subject.has_staged_non_handoff_changes = lambda _worktree: True
-            subject.archive_handoff = lambda *_args: repo / ".codex" / "archive"
-            subject.require_ready_for_integration = lambda _worktree, _branch: None
-
-            subject.finish(
-                repo,
-                self.workflow_state(feature, merge_mode=subject.config.merge_mode),
-                flow.Names("plan", "feature/plan", feature, "plan-run"),
-                plan,
-            )
-            self.assertEqual(resolved, [True])
-
-    def test_parser_rejects_removed_yes_option(self) -> None:
-        with self.assertRaises(SystemExit):
-            flow.build_parser().parse_args(["--plan", "plan.md", "--yes"])
-
-    def test_parser_accepts_command_timeout_seconds(self) -> None:
-        args = flow.build_parser().parse_args(
-            ["--plan", "plan.md", "--command-timeout-seconds", "2.5"]
-        )
-        self.assertEqual(args.command_timeout_seconds, 2.5)
-
-    def test_parser_rejects_non_finite_command_timeout_seconds(self) -> None:
-        with self.assertRaises(SystemExit):
-            flow.build_parser().parse_args(
-                ["--plan", "plan.md", "--command-timeout-seconds", "nan"]
-            )
-
-    def test_main_passes_command_timeout_seconds_to_runner(self) -> None:
-        created = {}
-
-        class FakeFlow:
-            def __init__(self, config, runner) -> None:
-                created["config"] = config
-                created["runner"] = runner
-
-            def run(self) -> None:
-                created["ran"] = True
-
-        with (
-            tempfile.TemporaryDirectory() as temp,
-            mock.patch.object(flow, "HarnessWorktreeFlow", FakeFlow),
-        ):
-            result = flow.main(
-                [
-                    "--plan",
-                    str(Path(temp) / "plan.md"),
-                    "--command-timeout-seconds",
-                    "3.5",
-                ]
-            )
-
-        self.assertEqual(result, 0)
-        self.assertTrue(created["ran"])
-        self.assertEqual(created["config"].command_timeout_seconds, 3.5)
-        self.assertEqual(created["runner"].command_timeout_seconds, 3.5)
-
-    def test_main_resume_without_worktree_infers_matching_state_worktree(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            repo = Path(temp) / "repo"
-            run_id = "20260629-082455-plan"
-            plan = repo / ".codex" / "worktree-flow" / run_id / "plan.md"
-            decoy = Path(temp) / "repo-a-decoy"
-            feature = Path(temp) / "repo-z-feature"
-            repo.mkdir()
-            plan.parent.mkdir(parents=True)
-            plan.write_text("# Plan", encoding="utf-8")
-
-            subject = flow.HarnessWorktreeFlow(self.config(repo, plan), FakeRunner())
-            for worktree, state_run_id in ((decoy, "different-run"), (feature, run_id)):
-                worktree_plan = (
-                    worktree / ".codex" / "worktree-flow" / state_run_id / "plan.md"
-                )
-                worktree_plan.parent.mkdir(parents=True)
-                worktree_plan.write_text("# Plan", encoding="utf-8")
-                state = flow.replace(
-                    self.workflow_state(worktree),
-                    run_id=state_run_id,
-                    feature_worktree=str(worktree),
-                    plan_path=str(worktree_plan),
-                )
-                subject.save_workflow_state(state, worktree=worktree)
-
-            resumed = {}
-
-            class FakeCommandRunner(FakeRunner):
-                def __init__(
-                    self,
-                    dry_run: bool = False,
-                    *,
-                    verbose: bool = False,
-                    command_timeout_seconds: float | None = None,
-                ) -> None:
-                    worktree_list = (
-                        f"worktree {repo}\n\n"
-                        f"worktree {decoy}\n\n"
-                        f"worktree {feature}\n\n"
-                    )
-                    super().__init__(
-                        {("git", "worktree", "list", "--porcelain"): worktree_list},
-                        dry_run=dry_run,
-                    )
-
-            def fake_resume(self, **kwargs) -> None:
-                resumed.update(kwargs)
-
-            with (
-                mock.patch.object(flow, "CommandRunner", FakeCommandRunner),
-                mock.patch.object(flow.HarnessWorktreeFlow, "git_root", return_value=repo),
-                mock.patch.object(flow.HarnessWorktreeFlow, "validate", return_value=None),
-                mock.patch.object(flow.HarnessWorktreeFlow, "resume", fake_resume),
-            ):
-                result = flow.main(
-                    [
-                        "--resume",
-                        "--plan",
-                        str(plan),
-                        "--repo",
-                        str(repo),
-                        "--harness-dir",
-                        ".codex",
-                    ]
-                )
-
-            self.assertEqual(result, 0)
-            self.assertEqual(resumed["worktree"], feature.resolve())
-
-    def test_main_resume_explicit_worktree_overrides_state_inference(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            repo = Path(temp) / "repo"
-            run_id = "20260629-082455-plan"
-            plan = repo / ".codex" / "worktree-flow" / run_id / "plan.md"
-            inferred = Path(temp) / "repo-inferred"
-            explicit = Path(temp) / "manual feature"
-            repo.mkdir()
-            explicit.mkdir()
-            plan.parent.mkdir(parents=True)
-            plan.write_text("# Plan", encoding="utf-8")
-
-            subject = flow.HarnessWorktreeFlow(self.config(repo, plan), FakeRunner())
-            state = flow.replace(
-                self.workflow_state(inferred),
-                run_id=run_id,
-                feature_worktree=str(inferred),
-                plan_path=str(
-                    inferred / ".codex" / "worktree-flow" / run_id / "plan.md"
-                ),
-            )
-            subject.save_workflow_state(state, worktree=inferred)
-            resumed = {}
-
-            def fake_resume(self, **kwargs) -> None:
-                resumed.update(kwargs)
-
-            with (
-                mock.patch.object(flow.HarnessWorktreeFlow, "git_root", return_value=repo),
-                mock.patch.object(flow.HarnessWorktreeFlow, "validate", return_value=None),
-                mock.patch.object(flow.HarnessWorktreeFlow, "resume", fake_resume),
-            ):
-                result = flow.main(
-                    [
-                        "--resume",
-                        "--plan",
-                        str(plan),
-                        "--repo",
-                        str(repo),
-                        "--worktree",
-                        str(explicit),
-                        "--harness-dir",
-                        ".codex",
-                    ]
-                )
-
-            self.assertEqual(result, 0)
-            self.assertEqual(resumed["worktree"], explicit.resolve())
-
-    def test_main_resume_recovers_missing_primary_plan_from_worktree_state(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            repo = Path(temp) / "repo"
-            feature = Path(temp) / "repo-feature"
-            missing_plan = repo / ".codex" / "worktree-flow" / "plan-run" / "plan.md"
-            saved_plan = feature / ".codex" / "worktree-flow" / "plan-run" / "plan.md"
-            repo.mkdir()
-            saved_plan.parent.mkdir(parents=True)
-            saved_plan.write_text("# Saved Plan", encoding="utf-8")
-            subject = flow.HarnessWorktreeFlow(
-                self.config(repo, missing_plan), FakeRunner()
-            )
-            state = flow.replace(
-                self.workflow_state(feature),
-                plan_path=str(saved_plan),
-            )
-            subject.save_workflow_state(state, worktree=feature)
-            resumed = {}
-            validated = []
-
-            def fake_resume(self, **kwargs) -> None:
-                resumed.update(kwargs)
-
-            with (
-                mock.patch.object(flow.HarnessWorktreeFlow, "git_root", return_value=repo),
-                mock.patch.object(
-                    flow.HarnessWorktreeFlow,
-                    "validate",
-                    lambda self, _repo, plan: validated.append(plan),
-                ),
-                mock.patch.object(flow.HarnessWorktreeFlow, "resume", fake_resume),
-            ):
-                result = flow.main(
-                    [
-                        "--resume",
-                        "--plan",
-                        str(missing_plan),
-                        "--repo",
-                        str(repo),
-                        "--worktree",
-                        str(feature),
-                        "--harness-dir",
-                        ".codex",
-                    ]
-                )
-
-            self.assertEqual(result, 0)
-            self.assertEqual(validated, [saved_plan.resolve()])
-            self.assertEqual(resumed["plan"], saved_plan.resolve())
-
-    def test_refreshes_generated_integration_commit_after_base_advances(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            repo = Path(temp) / "repo"
-            integration = Path(temp) / "repo-integration"
-            repo.mkdir()
-            integration.mkdir()
-            divergent = flow.CommandResult(
-                ("git", "merge-base"), integration, 1, "", ""
-            )
-            runner = FakeRunner(
-                {
-                    (
-                        "git",
-                        "merge-base",
-                        "--is-ancestor",
-                        "main",
-                        "integration/plan",
-                    ): divergent,
-                    ("git", "branch", "--show-current"): "integration/plan\n",
-                    ("git", "status", "--porcelain", "--untracked-files=all"): "",
-                    (
-                        "git",
-                        "log",
-                        "-1",
-                        "--format=%s",
-                        "integration/plan",
-                    ): "Harness: Plan\n",
-                }
-            )
-            subject = flow.HarnessWorktreeFlow(
-                self.config(repo, repo / "plan.md"), runner
-            )
-            state = flow.replace(
-                self.workflow_state(repo),
-                integration_branch="integration/plan",
-                integration_worktree=str(integration),
-                completed_stage="integration_committed",
-            )
-            subject.save_workflow_state = lambda *_args, **_kwargs: None
-
-            updated = subject.refresh_committed_integration_for_advanced_base(
-                state, integration, "integration/plan"
-            )
-
-            self.assertEqual(updated.completed_stage, "integration_worktree_created")
-            self.assertIn(
-                (("git", "reset", "--hard", "main"), integration, True),
-                runner.calls,
-            )
-
-    def test_refuses_to_refresh_dirty_integration_work(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            repo = Path(temp) / "repo"
-            integration = Path(temp) / "repo-integration"
-            repo.mkdir()
-            integration.mkdir()
-            divergent = flow.CommandResult(
-                ("git", "merge-base"), integration, 1, "", ""
-            )
-            runner = FakeRunner(
-                {
-                    (
-                        "git",
-                        "merge-base",
-                        "--is-ancestor",
-                        "main",
-                        "integration/plan",
-                    ): divergent,
-                    ("git", "branch", "--show-current"): "integration/plan\n",
-                    (
-                        "git",
-                        "status",
-                        "--porcelain",
-                        "--untracked-files=all",
-                    ): " M app.py\n",
-                }
-            )
-            subject = flow.HarnessWorktreeFlow(
-                self.config(repo, repo / "plan.md"), runner
-            )
-            state = flow.replace(
-                self.workflow_state(repo),
-                completed_stage="integration_committed",
-            )
-
-            with self.assertRaisesRegex(flow.FlowError, "pending non-handoff"):
-                subject.refresh_committed_integration_for_advanced_base(
-                    state, integration, "integration/plan"
-                )
-            self.assertFalse(
-                any(call[0][:3] == ("git", "reset", "--hard") for call in runner.calls)
-            )
-
-    def test_resume_command_args_uses_saved_workflow_state(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            repo = Path(temp) / "repo"
-            feature = Path(temp) / "repo-feature path"
-            integration = Path(temp) / "repo-integration"
-            plan = repo / "docs" / "plans" / "plan.md"
-            repo.mkdir(parents=True)
-            config = self.config(repo, plan, model="gpt-test")
-            subject = flow.HarnessWorktreeFlow(config, FakeRunner())
-            state = self.workflow_state(feature)
-            state = flow.replace(
-                state,
-                integration_worktree=str(integration),
-                integration_branch="integration/plan",
-            )
-
-            subject.save_workflow_state(state)
-
-            args = subject.resume_command_args()
-            self.assertIsNotNone(args)
-            assert args is not None
-            self.assertEqual(args[0], sys.executable)
-            self.assertEqual(args[1], str(Path(flow.__file__).resolve()))
-            self.assertIn("--resume", args)
-            self.assertEqual(
-                args[args.index("--plan") + 1],
-                str(subject.resume_plan_path(state)),
-            )
-            self.assertEqual(args[args.index("--worktree") + 1], str(feature))
-            self.assertEqual(args[args.index("--repo") + 1], str(repo))
-            self.assertEqual(args[args.index("--base") + 1], "main")
-            self.assertEqual(args[args.index("--branch") + 1], "feature/plan")
-            self.assertEqual(args[args.index("--run-id") + 1], "plan-run")
-            self.assertEqual(args[args.index("--model") + 1], "gpt-test")
-            self.assertEqual(
-                args[args.index("--integration-worktree") + 1], str(integration)
-            )
-            self.assertEqual(
-                args[args.index("--integration-branch") + 1], "integration/plan"
-            )
-
-    def test_main_prints_resume_command_on_failure(self) -> None:
-        class FakeFlow:
-            def __init__(self, config, runner) -> None:
-                pass
-
-            def run(self) -> None:
-                raise flow.FlowError("boom")
-
-            def resume_command(self) -> str:
-                return "python worktree-flow.py --resume --worktree repo-feature"
-
-        with (
-            tempfile.TemporaryDirectory() as temp,
-            mock.patch.object(flow, "HarnessWorktreeFlow", FakeFlow),
-        ):
-            stderr = io.StringIO()
-            with redirect_stderr(stderr):
-                result = flow.main(["--plan", str(Path(temp) / "plan.md")])
-
-        self.assertEqual(result, 1)
-        text = stderr.getvalue()
-        self.assertIn("boom", text)
-        self.assertIn("Resume command:", text)
-        self.assertIn(
-            "python worktree-flow.py --resume --worktree repo-feature", text
-        )
-
-    def test_local_git_worktree_and_squash_merge(self) -> None:
-        if not shutil.which("git"):
-            self.skipTest("git is not installed")
-        with tempfile.TemporaryDirectory() as temp:
-            repo = Path(temp) / "repo"
-            subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True)
-            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
-            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
-            (repo / "file.txt").write_text("base\n", encoding="utf-8")
-            subprocess.run(["git", "add", "file.txt"], cwd=repo, check=True)
-            subprocess.run(["git", "commit", "-m", "base"], cwd=repo, check=True, capture_output=True)
-
-            feature = Path(temp) / "repo-feature"
-            subprocess.run(["git", "worktree", "add", str(feature), "-b", "feature/test", "main"], cwd=repo, check=True, capture_output=True)
-            (feature / "file.txt").write_text("feature\n", encoding="utf-8")
-            subprocess.run(["git", "add", "file.txt"], cwd=feature, check=True)
-            subprocess.run(["git", "commit", "-m", "feature"], cwd=feature, check=True, capture_output=True)
-
-            integration = Path(temp) / "repo-integration"
-            subprocess.run(["git", "worktree", "add", str(integration), "-b", "integration/test", "main"], cwd=repo, check=True, capture_output=True)
-            subprocess.run(["git", "merge", "--squash", "feature/test"], cwd=integration, check=True, capture_output=True)
-            (integration / ".codex" / "handoff").mkdir(parents=True)
-            (integration / ".codex" / "handoff" / "implementation-summary.md").write_text("impl", encoding="utf-8")
-            subject = flow.HarnessWorktreeFlow(
-                self.config(repo, repo / "plan.md"), flow.CommandRunner()
-            )
-            subject.stage_integration_changes(integration)
-            subprocess.run(["git", "commit", "-m", "Harness: test"], cwd=integration, check=True, capture_output=True)
-            subprocess.run(["git", "switch", "main"], cwd=repo, check=True, capture_output=True)
-            subprocess.run(["git", "merge", "--ff-only", "integration/test"], cwd=repo, check=True, capture_output=True)
-
-            committed = subprocess.run(
-                ["git", "ls-tree", "-r", "--name-only", "HEAD"],
-                cwd=repo,
-                check=True,
-                capture_output=True,
-                text=True,
-            ).stdout.splitlines()
-            self.assertEqual((repo / "file.txt").read_text(encoding="utf-8"), "feature\n")
-            self.assertIn("file.txt", committed)
-            self.assertNotIn(".codex/handoff/implementation-summary.md", committed)
-
-    def write_jsonl_file(self, path: Path, records: list[dict[str, object]]) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            "".join(json.dumps(record) + "\n" for record in records),
-            encoding="utf-8",
-        )
-
-    def read_json_file(self, path: Path):
-        return json.loads(path.read_text(encoding="utf-8"))
-
-    def read_jsonl_file(self, path: Path) -> list[dict[str, object]]:
-        return [
-            json.loads(line)
-            for line in path.read_text(encoding="utf-8").splitlines()
-            if line
-        ]
-
-    def usage_artifacts_text(self, handoff: Path) -> str:
-        return "\n".join(
-            (handoff / name).read_text(encoding="utf-8")
-            for name in (
-                "usage-events.jsonl",
-                "usage-summary.json",
-                "usage-sources.json",
-            )
-            if (handoff / name).exists()
-        )
-
-    def omp_config(
-        self,
-        repo: Path,
-        plan: Path,
-        *,
-        model: str | None = None,
-        merge_mode: str = "squash",
-    ):
-        return flow.FlowConfig(
-            repo=repo,
-            plan=plan,
-            base="main",
-            model=model,
-            harness="omp",
-            harness_dir=Path(".omp"),
-            merge_mode=merge_mode,
-            keep_worktrees=False,
-        )
+class WorktreeFlowTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.repo = self.root / "repo"
+        self.repo.mkdir()
+        self.init_repo()
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def init_repo(self) -> None:
+        run_git(self.repo, "init", "-q")
+        run_git(self.repo, "config", "user.email", "test@example.invalid")
+        run_git(self.repo, "config", "user.name", "Worktree Test")
+        run_git(self.repo, "switch", "-c", "main")
+        (self.repo / "README.txt").write_text("base\n", encoding="utf-8")
+        run_git(self.repo, "add", "README.txt")
+        run_git(self.repo, "commit", "-qm", "base")
+
+    def plan(self, title: str = "Approved Plan") -> Path:
+        plan = self.repo / "docs" / "plan.md"
+        plan.parent.mkdir(parents=True, exist_ok=True)
+        plan.write_text(f"# {title}\n\nChange the fixture.\n", encoding="utf-8")
+        run_git(self.repo, "add", "docs/plan.md")
+        run_git(self.repo, "commit", "-qm", "plan")
+        return plan
 
     def config(
         self,
-        repo: Path,
         plan: Path,
         *,
-        model: str | None = None,
-        merge_mode: str = "squash",
-    ):
-        return flow.FlowConfig(
-            repo=repo,
+        harness_name: str = "omp",
+        merge_mode: str | None = "squash",
+        resume: bool = False,
+        worktree: Path | None = None,
+        state_dir: Path | None = None,
+        **kwargs: object,
+    ) -> models.FlowConfig:
+        return models.FlowConfig(
+            repo=self.repo,
             plan=plan,
             base="main",
-            model=model,
-            harness="codex",
-            harness_dir=Path(".codex"),
+            harness=harness_name,
+            harness_dir=Path(".harness"),
+            state_dir=state_dir or self.root / "state",
             merge_mode=merge_mode,
-            keep_worktrees=False,
-        )
-    def workflow_state(self, feature: Path, *, merge_mode: str = "squash", plan_title: str = "Plan") -> flow.WorkflowState:
-        return flow.WorkflowState(
-            run_id="plan-run",
-            slug="plan",
-            base="main",
-            plan_title=plan_title,
-            feature_branch="feature/plan",
-            feature_worktree=str(feature),
-            merge_mode=merge_mode,
-            plan_path=str(feature / "docs" / "plans" / "plan.md"),
-            completed_stage="audit_complete",
+            resume=resume,
+            worktree=worktree,
+            entrypoint_path=ROOT / ".omp" / "scripts" / "worktree-flow.py",
+            **kwargs,
         )
 
+    def runtime(self, config: models.FlowConfig, runner: object | None = None) -> workflow.HarnessWorktreeFlow:
+        return workflow.HarnessWorktreeFlow(config, runner or command_runner.CommandRunner())
+
+    def bind(self, flow: workflow.HarnessWorktreeFlow) -> None:
+        raw_root = git_workspace.GitWorkspace.git_root(self.repo, command_runner.CommandRunner())
+        flow._bind_runtime(raw_root)
+
+    def make_fake_omp(self) -> Path:
+        bin_dir = self.root / "bin"
+        bin_dir.mkdir()
+        executable = bin_dir / "omp"
+        executable.write_text(
+            """#!/usr/bin/env python3
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+if '--help' in sys.argv:
+    print('fake omp help')
+    raise SystemExit(0)
+arg = next((item for item in reversed(sys.argv[1:]) if item.startswith('@')), None)
+if arg is None:
+    raise SystemExit('missing prompt')
+prompt = Path(arg[1:]).read_text(encoding='utf-8')
+handoff = Path.cwd() / '.harness' / 'handoff'
+handoff.mkdir(parents=True, exist_ok=True)
+if 'implement-worktree' in prompt:
+    (Path.cwd() / 'implemented.txt').write_text('implemented\\n', encoding='utf-8')
+    (handoff / 'implementation-summary.md').write_text('# Implementation\\n\\ncommitted\\n', encoding='utf-8')
+    subprocess.run(['git', 'add', 'implemented.txt'], check=True)
+    subprocess.run(['git', 'commit', '-qm', 'implementation'], check=True)
+elif 'merge-conflict-resolver' in prompt:
+    (handoff / 'conflict-resolution-summary.md').write_text('# Conflict Resolution\\n', encoding='utf-8')
+elif 'audit-worktree' in prompt:
+    (handoff / ('post-conflict-audit-summary.md' if 'post-conflict-audit-summary.md' in prompt else 'audit-summary.md')).write_text('# Audit\\n', encoding='utf-8')
+print('fake harness output')
+""",
+            encoding="utf-8",
+        )
+        executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
+        return bin_dir
+
+    def with_path(self, directory: Path):
+        return mock.patch.dict(os.environ, {"PATH": f"{directory}{os.pathsep}{os.environ.get('PATH', '')}"})
+
+    def test_cleanup_refuses_unregistered_paths_and_never_falls_back_to_rmtree(self) -> None:
+        plan = self.plan()
+        flow = self.runtime(self.config(plan))
+        self.bind(flow)
+        sentinel = self.root / "sentinel"
+        sentinel.mkdir()
+        (sentinel / "secret.txt").write_text("keep\n", encoding="utf-8")
+        branch = "feature/sentinel"
+        run_git(self.repo, "branch", branch)
+        with self.assertRaises(models.FlowError):
+            flow._remove_or_adopt_worktree(sentinel, branch, allow_adopt=True)
+        self.assertFalse(any(call[0][:3] == ("git", "worktree", "remove") for call in getattr(flow.runner, "calls", [])))
+
+    def test_dry_run_full_flow_is_zero_mutation(self) -> None:
+        plan = self.plan()
+        state_dir = self.root / "state"
+        before = snapshot_tree(self.root)
+        args = [
+            "--plan",
+            str(plan),
+            "--repo",
+            str(self.repo),
+            "--base",
+            "main",
+            "--harness",
+            "omp",
+            "--harness-dir",
+            ".harness",
+            "--state-dir",
+            str(state_dir),
+            "--dry-run",
+        ]
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            self.assertEqual(cli.main(args, entrypoint_path=ROOT / ".omp" / "scripts" / "worktree-flow.py"), 0)
+        output = stdout.getvalue()
+        self.assertIn("implementation", output)
+        self.assertIn("audit", output)
+        self.assertIn("@default", output)
+        self.assertIn("@slow", output)
+        self.assertIn("fast-forward", output)
+        self.assertIn("cleanup", output)
+        self.assertEqual(before, snapshot_tree(self.root))
+
+    def test_resume_rejects_corrupt_or_mismatched_state_before_side_effects(self) -> None:
+        plan = self.plan()
+        flow = self.runtime(self.config(plan))
+        self.bind(flow)
+        store = flow.state_store
+        assert store is not None
+        run_id = "20260802-120000-approved-plan"
+        run_dir = store.reserve_run(run_id)
+        state_path = run_dir / paths.WORKFLOW_STATE_FILENAME
+        state_path.write_bytes(b"not utf-8: \xff")
+        with self.assertRaises(models.FlowError):
+            store.load(run_id)
+        state_path.write_text(json.dumps({"schema_version": 1}), encoding="utf-8")
+        with self.assertRaises(models.FlowError):
+            store.load(run_id)
+
+    def test_state_replace_failure_preserves_last_good_state(self) -> None:
+        plan = self.plan()
+        flow = self.runtime(self.config(plan))
+        self.bind(flow)
+        store = flow.state_store
+        assert store is not None and flow.git is not None
+        run_id = "20260802-120000-approved-plan"
+        store.reserve_run(run_id)
+        saved = make_state(flow, run_id, plan, flow.git.head(self.repo))
+        store.save(saved)
+        target = store.state_path(run_id)
+        original = target.read_bytes()
+        with mock.patch.object(paths.os, "replace", side_effect=OSError("injected replace failure")):
+            with self.assertRaises(models.FlowError):
+                store.save(models.WorkflowState(**{**saved.__dict__, "plan_title": "changed"}))
+        self.assertEqual(target.read_bytes(), original)
+        self.assertFalse(any(path.name.endswith(".tmp") for path in target.parent.iterdir()))
+
+    def test_run_lock_rejects_concurrent_resume(self) -> None:
+        plan = self.plan()
+        flow = self.runtime(self.config(plan))
+        self.bind(flow)
+        store = flow.state_store
+        assert store is not None
+        run_id = "20260802-120000-approved-plan"
+        store.reserve_run(run_id)
+        with store.lock(run_id):
+            with self.assertRaises(models.FlowError):
+                with store.lock(run_id):
+                    pass
+        with store.lock(run_id):
+            pass
+
+    def test_saved_plan_reservation_is_claimed_once(self) -> None:
+        plan = self.plan()
+        run_id = "20260802-120000-approved-plan"
+        reservation = self.repo / ".harness" / "worktree-flow" / run_id
+        reservation.mkdir(parents=True)
+        saved_plan = reservation / "plan.md"
+        shutil.copyfile(plan, saved_plan)
+        flow = self.runtime(self.config(saved_plan))
+        flow.repo = self.repo
+        flow._validate_saved_plan_reservation(saved_plan, run_id)
+        (reservation / "unexpected.txt").write_text("bad\n", encoding="utf-8")
+        with self.assertRaises(models.FlowError):
+            flow._validate_saved_plan_reservation(saved_plan, run_id)
+        (reservation / "unexpected.txt").unlink()
+        (reservation / "linked.txt").symlink_to(self.root / "secret")
+        with self.assertRaises(models.FlowError):
+            flow._validate_saved_plan_reservation(saved_plan, run_id)
+
+    def test_feature_allocation_interruptions_are_resumable_or_refused(self) -> None:
+        plan = self.plan()
+        flow = self.runtime(self.config(plan))
+        self.bind(flow)
+        assert flow.git is not None and flow.state_store is not None
+        run_id = "20260802-120000-approved-plan"
+        flow.state_store.reserve_run(run_id)
+        names = models.Names("approved-plan", "feature/approved-plan", self.root / "repo-approved-plan", run_id)
+        saved = make_state(flow, run_id, plan, flow.git.head(self.repo), names=names)
+        flow.state_store.save(saved)
+        created = flow._allocate_feature(saved, names)
+        self.assertEqual(created.stage, models.WorkflowStage.FEATURE_WORKTREE_CREATED)
+        self.assertEqual(flow.git.current_branch(names.feature_worktree), names.feature_branch)
+        mismatch_names = models.Names("approved-plan", "feature/other", names.feature_worktree, run_id)
+        with self.assertRaises(models.FlowError):
+            flow._allocate_feature(saved, mismatch_names)
+
+    def test_harness_dir_must_be_confined_relative_path(self) -> None:
+        invalid = ["", ".", "..", "/tmp/x", r"C:\\x", r"\\\\server\\share", "a//b", "a/../b", "CON", "a:stream", "a\x00b"]
+        for value in invalid:
+            with self.subTest(value=value):
+                with self.assertRaises(models.FlowError):
+                    paths.validate_harness_dir(value)
+        self.assertEqual(paths.validate_harness_dir(".omp"), Path(".omp"))
+        self.assertEqual(paths.validate_harness_dir("nested/harness"), Path("nested/harness"))
+
+    def test_git_pathspecs_treat_harness_paths_literally(self) -> None:
+        literal = self.repo / "art*" / "handoff" / "tracked.txt"
+        sibling = self.repo / "art-other" / "handoff" / "other.txt"
+        literal.parent.mkdir(parents=True)
+        sibling.parent.mkdir(parents=True)
+        literal.write_text("literal\n", encoding="utf-8")
+        sibling.write_text("sibling\n", encoding="utf-8")
+        run_git(self.repo, "add", "-A")
+        run_git(self.repo, "commit", "-m", "pathspec fixture")
+        workspace = git_workspace.GitWorkspace(
+            self.repo,
+            command_runner.CommandRunner(),
+            harness_dir=Path("art*"),
+        )
+        self.assertEqual(workspace.tracked_handoff_paths(), ["art*/handoff/tracked.txt"])
+
+    def test_resume_accepts_only_exact_recorded_integration_fingerprint(self) -> None:
+        plan = self.plan()
+        integration_dir = self.root / "integration"
+        run_git(self.repo, "worktree", "add", "-b", "integration/approved-plan-20260802-120000", str(integration_dir), "main")
+        workspace = git_workspace.GitWorkspace(self.repo, command_runner.CommandRunner(), harness_dir=Path(".harness"))
+        fingerprint = workspace.fingerprint(integration_dir)
+        flow = self.runtime(self.config(plan))
+        flow.git = workspace
+        state_obj = object.__new__(models.WorkflowState)
+        del state_obj
+        state_record = type("State", (), {"integration_worktree_fingerprint": fingerprint})()
+        real_state = state_record
+        with mock.patch.object(workspace, "fingerprint", return_value=fingerprint):
+            flow._verify_integration_checkpoint(real_state, integration_dir)
+        (integration_dir / "dirty.txt").write_text("changed\n", encoding="utf-8")
+        changed = workspace.fingerprint(integration_dir)
+        self.assertNotEqual(changed, fingerprint)
+        with self.assertRaises(models.FlowError):
+            flow._verify_integration_checkpoint(type("State", (), {"integration_worktree_fingerprint": fingerprint})(), integration_dir)
+        run_git(self.repo, "worktree", "remove", "--force", str(integration_dir))
+        run_git(self.repo, "branch", "-D", "integration/approved-plan-20260802-120000")
+
+    def test_precreated_audit_summary_cannot_suppress_audit(self) -> None:
+        plan = self.plan()
+        bin_dir = self.make_fake_omp()
+        with self.with_path(bin_dir):
+            config = self.config(plan, merge_mode="stop", keep_worktrees=True)
+            flow = self.runtime(config)
+            flow.run()
+        state_file = next((self.root / "state").rglob(paths.WORKFLOW_STATE_FILENAME))
+        saved = json.loads(state_file.read_text(encoding="utf-8"))
+        self.assertEqual(saved["stage"], models.WorkflowStage.STOPPED_BEFORE_MERGE.value)
+        feature = Path(saved["feature_worktree"])
+        summary = feature / ".harness" / "handoff" / "audit-summary.md"
+        summary.write_text("# stale\n", encoding="utf-8")
+        with self.with_path(bin_dir):
+            resumed = self.runtime(self.config(plan, merge_mode="squash", resume=True, worktree=feature, keep_worktrees=True))
+            resumed.resume()
+        self.assertTrue(summary.exists())
+        self.assertIn("# Audit", summary.read_text(encoding="utf-8"))
+
+    def test_failed_audit_summary_is_retried(self) -> None:
+        plan = self.plan()
+        bin_dir = self.make_fake_omp()
+        with self.with_path(bin_dir):
+            flow = self.runtime(self.config(plan, merge_mode="stop"))
+            flow.run()
+        state_file = next((self.root / "state").rglob(paths.WORKFLOW_STATE_FILENAME))
+        self.assertEqual(json.loads(state_file.read_text(encoding="utf-8"))["stage"], "stopped_before_merge")
+
+    def test_audit_receipt_head_change_reaudits_and_plan_digest_change_refuses(self) -> None:
+        plan = self.plan()
+        bin_dir = self.make_fake_omp()
+        with self.with_path(bin_dir):
+            flow = self.runtime(self.config(plan, merge_mode="stop"))
+            flow.run()
+        state_file = next((self.root / "state").rglob(paths.WORKFLOW_STATE_FILENAME))
+        state_data = json.loads(state_file.read_text(encoding="utf-8"))
+        feature = Path(state_data["feature_worktree"])
+        run_git(feature, "commit", "--allow-empty", "-qm", "post-audit")
+        state_data["stage"] = "audit_complete"
+        state_data["audit_head"] = state_data["feature_base_commit"]
+        state_file.write_text(json.dumps(state_data), encoding="utf-8")
+        with self.with_path(bin_dir):
+            resumed = self.runtime(self.config(plan, merge_mode=None, resume=True, worktree=feature))
+            resumed.resume()
+        plan.write_text("# Changed Plan\n", encoding="utf-8")
+        with self.assertRaises(models.FlowError):
+            resumed.resume()
+
+    def test_completed_phase_dirt_is_refused(self) -> None:
+        plan = self.plan()
+        workspace = git_workspace.GitWorkspace(self.repo, command_runner.CommandRunner(), harness_dir=Path(".harness"))
+        (self.repo / "README.txt").write_text("dirty\n", encoding="utf-8")
+        with self.assertRaises(models.FlowError):
+            workspace.require_primary_ready("main")
+        (self.repo / "README.txt").write_text("base\n", encoding="utf-8")
+        feature = self.root / "feature"
+        run_git(self.repo, "worktree", "add", "-b", "feature/dirt", str(feature), "main")
+        (feature / "dirty.txt").write_text("dirty\n", encoding="utf-8")
+        with self.assertRaises(models.FlowError):
+            workspace.require_clean_except_artifacts(feature, phase="Completed audit")
+        run_git(self.repo, "worktree", "remove", "--force", str(feature))
+        run_git(self.repo, "branch", "-D", "feature/dirt")
+
+    def test_resume_dispatches_base_fast_forwarded_through_complete(self) -> None:
+        plan = self.plan()
+        bin_dir = self.make_fake_omp()
+        with self.with_path(bin_dir):
+            flow = self.runtime(self.config(plan, merge_mode="squash"))
+            flow.run()
+            state_file = next((self.root / "state").rglob(paths.WORKFLOW_STATE_FILENAME))
+            data = json.loads(state_file.read_text(encoding="utf-8"))
+            resumed = self.runtime(self.config(plan, resume=True, merge_mode="squash", worktree=Path(data["feature_worktree"])))
+            resumed.resume()
+        self.assertEqual(json.loads(state_file.read_text(encoding="utf-8"))["stage"], "complete")
+
+    def test_base_advance_rebuilds_only_validated_integration(self) -> None:
+        plan = self.plan()
+        flow = self.runtime(self.config(plan))
+        self.bind(flow)
+        assert flow.git is not None
+        integration_dir = self.root / "repo-integrate-approved-plan-20260802-120000"
+        branch = "integration/approved-plan-20260802-120000"
+        run_git(self.repo, "worktree", "add", "-b", branch, str(integration_dir), "main")
+        run_git(self.repo, "commit", "--allow-empty", "-qm", "Harness: Approved Plan")
+        run_git(self.repo, "switch", "main")
+        (self.repo / "README.txt").write_text("advanced\n", encoding="utf-8")
+        run_git(self.repo, "add", "README.txt")
+        run_git(self.repo, "commit", "-qm", "base advance")
+        self.assertNotEqual(flow.git.branch_tip("main"), flow.git.head(integration_dir))
+        run_git(self.repo, "worktree", "remove", "--force", str(integration_dir))
+        run_git(self.repo, "branch", "-D", branch)
+
+    def test_stopped_run_requires_explicit_merge_mode_to_continue(self) -> None:
+        plan = self.plan()
+        bin_dir = self.make_fake_omp()
+        with self.with_path(bin_dir):
+            flow = self.runtime(self.config(plan, merge_mode="stop"))
+            flow.run()
+            state_file = next((self.root / "state").rglob(paths.WORKFLOW_STATE_FILENAME))
+            stopped = state_file.read_bytes()
+            data = json.loads(stopped)
+            self.assertEqual(data["stage"], "stopped_before_merge")
+            self.assertIsInstance(data["archive_commit"], str)
+            self.assertEqual(
+                run_git(self.repo, "show", "-s", "--format=%s", data["archive_commit"]).strip(),
+                "Harness: stop Approved Plan",
+            )
+            feature = Path(data["feature_worktree"])
+            no_mode = self.runtime(self.config(plan, merge_mode=None, resume=True, worktree=feature))
+            no_mode.resume()
+            self.assertEqual(stopped, state_file.read_bytes())
+            continue_flow = self.runtime(self.config(plan, merge_mode="squash", resume=True, worktree=feature))
+            continue_flow.resume()
+        self.assertEqual(json.loads(state_file.read_text(encoding="utf-8"))["stage"], "complete")
+
+    def test_base_must_be_local_branch(self) -> None:
+        workspace = git_workspace.GitWorkspace(self.repo, command_runner.CommandRunner(), harness_dir=Path(".harness"))
+        for name in ("HEAD", "origin/main", "deadbeef", "-bad", "missing"):
+            with self.subTest(name=name):
+                with self.assertRaises(models.FlowError):
+                    workspace.require_local_branch(name)
+        self.assertEqual(workspace.require_local_branch("main"), "main")
+
+    def test_oversized_state_and_artifacts_fail_before_read_or_copy(self) -> None:
+        oversized = self.root / "oversized.bin"
+        with oversized.open("wb") as handle:
+            handle.truncate(paths.MAX_ARTIFACT_BYTES + 1)
+        with self.assertRaises(models.FlowError):
+            paths.sha256_file(oversized)
+        with self.assertRaises(models.FlowError):
+            paths.safe_copy(oversized, self.root / "copy.bin")
+        self.assertFalse((self.root / "copy.bin").exists())
+
+    def test_plan_and_handoff_symlinks_fail_closed(self) -> None:
+        secret = self.root / "secret.txt"
+        secret.write_text("secret\n", encoding="utf-8")
+        link = self.root / "plan-link.md"
+        link.symlink_to(secret)
+        with self.assertRaises(models.FlowError):
+            paths.read_text_bounded(link)
+        broken = self.root / "broken-link"
+        broken.symlink_to(self.root / "missing-target")
+        with self.assertRaises(models.FlowError):
+            paths.canonical_path(broken, must_exist=False)
+        with self.assertRaises(models.FlowError):
+            paths.require_confined(self.root, broken)
+        destination = self.root / "destination.txt"
+        destination.symlink_to(secret)
+        with self.assertRaises(models.FlowError):
+            paths.atomic_write_text(destination, "overwrite\n")
+        self.assertEqual(secret.read_text(encoding="utf-8"), "secret\n")
+
+    def test_harness_logs_never_persist_raw_output(self) -> None:
+        plan = self.plan()
+        worktree = self.root / "worktree"
+        worktree.mkdir()
+        config = self.config(plan, harness_name="codex")
+        secret = "SECRET_MARKER"
+        result = command_runner.CommandResult(("codex", "exec"), worktree, 9, secret, secret, "start", "finish", 2)
+        runner = FakeRunner({("codex", "exec", "--cd", str(worktree), "--sandbox", "workspace-write", "-"): result})
+        events: list[dict[str, object]] = []
+        adapter = harness.HarnessAdapter(
+            config,
+            runner,
+            logger=lambda _event, fields: events.append(dict(fields)),
+            usage=usage.UsageCollector(harness="codex", harness_dir=Path(".harness")),
+        )
+        with self.assertRaises(models.FlowError) as raised:
+            adapter.execute(worktree, "Prompt", phase="implementation")
+        self.assertNotIn(secret, str(raised.exception))
+        self.assertTrue(events)
+        self.assertNotIn(secret, json.dumps(events))
+        self.assertNotIn(secret, (worktree / ".harness" / "handoff" / "usage-events.jsonl").read_text(encoding="utf-8"))
+        self.assertTrue((worktree / ".harness" / "handoff" / "implementation-diagnostics.log").exists())
+
+    def test_phase_models_and_harness_adapters(self) -> None:
+        plan = self.plan()
+        cwd = self.root / "cwd"
+        cwd.mkdir()
+        prompt = cwd / "prompt.md"
+        prompt.write_text("prompt\n", encoding="utf-8")
+        omp_config = self.config(plan, harness_name="omp")
+        omp = harness.HarnessAdapter(omp_config, FakeRunner())
+        self.assertIn("@default", omp.omp_args(prompt, "implementation"))
+        self.assertIn("@slow", omp.omp_args(prompt, "audit"))
+        codex_config = self.config(plan, harness_name="codex", model="gpt-test")
+        codex = harness.HarnessAdapter(codex_config, FakeRunner())
+        self.assertEqual(codex.codex_args(cwd, "implementation")[-1], "-")
+        self.assertIn("gpt-test", codex.codex_args(cwd, "implementation"))
+        opencode_config = self.config(plan, harness_name="opencode", model="gpt-test")
+        opencode = harness.HarnessAdapter(opencode_config, FakeRunner())
+        args = opencode.opencode_args(cwd, prompt, "audit")
+        self.assertEqual(args[:2], ["opencode", "run"])
+        self.assertIn("--dir", args)
+        self.assertIn("--file", args)
+        with self.assertRaises(models.FlowError):
+            models.HarnessKind.from_executable("claude")
+        self.assertEqual(harness.phase_model(models.HarnessKind.OMP, "audit", implementation_model=None, review_model="review", model="global"), "review")
+
+    def test_completed_run_id_cannot_start_again_and_archive_is_exact_manifest(self) -> None:
+        plan = self.plan()
+        bin_dir = self.make_fake_omp()
+        with self.with_path(bin_dir):
+            flow = self.runtime(self.config(plan))
+            flow.run()
+            second = self.runtime(self.config(plan))
+            with self.assertRaises(models.FlowError):
+                second.run()
+        manager = integration.IntegrationManager(
+            git_workspace.GitWorkspace(self.repo, command_runner.CommandRunner(), harness_dir=Path(".harness")),
+            harness_dir=Path(".harness"),
+        )
+        archive = self.root / "archive"
+        archive.mkdir()
+        (archive / "unknown.txt").write_text("bad\n", encoding="utf-8")
+        with self.assertRaises(models.FlowError):
+            manager.prepare_archive(archive)
+
+    def test_conflict_context_survives_resolution_retry_cleanup(self) -> None:
+        plan = self.plan()
+        manager = integration.IntegrationManager(
+            git_workspace.GitWorkspace(self.repo, command_runner.CommandRunner(), harness_dir=Path(".harness")),
+            harness_dir=Path(".harness"),
+        )
+        flow = self.runtime(self.config(plan))
+        flow.integration = manager
+        worktree = self.root / "integration"
+        context = worktree / ".harness" / "handoff" / "merge-conflict-context.md"
+        context.parent.mkdir(parents=True)
+        context.write_text("conflict details\n", encoding="utf-8")
+        for name in ("post_conflict_audit-prompt.md", "post_conflict_audit-diagnostics.log"):
+            (context.parent / name).write_text("stale\n", encoding="utf-8")
+        flow._remove_phase_outputs(worktree, "conflict_resolution")
+        self.assertEqual(context.read_text(encoding="utf-8"), "conflict details\n")
+        self.assertFalse((context.parent / "post_conflict_audit-prompt.md").exists())
+        self.assertFalse((context.parent / "post_conflict_audit-diagnostics.log").exists())
+    def test_post_conflict_audit_retry_removes_stale_summary(self) -> None:
+        manager = integration.IntegrationManager(
+            git_workspace.GitWorkspace(self.repo, command_runner.CommandRunner(), harness_dir=Path(".harness")),
+            harness_dir=Path(".harness"),
+        )
+        worktree = self.root / "integration"
+        handoff = worktree / ".harness" / "handoff"
+        handoff.mkdir(parents=True)
+        for name in (
+            "post-conflict-audit-summary.md",
+            "post_conflict_audit-prompt.md",
+            "post_conflict_audit-diagnostics.log",
+        ):
+            (handoff / name).write_text("stale\n", encoding="utf-8")
+        manager.remove_phase_outputs(worktree, phase="post_conflict_audit")
+        self.assertEqual(list(handoff.iterdir()), [])
+    def test_archive_handoff_removes_stale_allowlisted_outputs(self) -> None:
+        plan = self.plan()
+        manager = integration.IntegrationManager(
+            git_workspace.GitWorkspace(self.repo, command_runner.CommandRunner(), harness_dir=Path(".harness")),
+            harness_dir=Path(".harness"),
+        )
+        source = self.root / "source"
+        source_handoff = source / ".harness" / "handoff"
+        source_handoff.mkdir(parents=True)
+        (source_handoff / "implementation-summary.md").write_text("# Implementation\n", encoding="utf-8")
+        archive = self.root / "archive"
+        archive.mkdir()
+        (archive / "audit-summary.md").write_text("stale\n", encoding="utf-8")
+        manager.archive_handoff(source, archive, plan)
+        self.assertFalse((archive / "audit-summary.md").exists())
+        self.assertTrue((archive / "implementation-summary.md").exists())
+        self.assertEqual((archive / "plan.md").read_bytes(), plan.read_bytes())
+
+    def test_preview_uses_executable_basename_for_adapter_selection(self) -> None:
+        plan = self.plan()
+        flow = self.runtime(self.config(plan, harness_name="/usr/bin/opencode"))
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            flow.preview()
+        rendered = output.getvalue()
+        self.assertIn("/usr/bin/opencode run", rendered)
+        self.assertNotIn("--no-session", rendered)
+
+
+    def test_full_local_git_smoke(self) -> None:
+        plan = self.plan("Local Git Smoke")
+        bin_dir = self.make_fake_omp()
+        with self.with_path(bin_dir):
+            flow = self.runtime(self.config(plan, merge_mode="squash"))
+            flow.run()
+        self.assertEqual(run_git(self.repo, "branch", "--show-current"), "main")
+        self.assertTrue((self.repo / "implemented.txt").exists())
+        self.assertTrue(any(path.name == paths.WORKFLOW_STATE_FILENAME for path in (self.root / "state").rglob("*")))
+
+
+class CommandAndStateTests(unittest.TestCase):
+    def test_positive_timeout_and_parser(self) -> None:
+        self.assertEqual(cli.positive_seconds("1.5"), 1.5)
+        with self.assertRaises(cli.argparse.ArgumentTypeError):
+            cli.positive_seconds("0")
+
+    def test_command_failure_format_excludes_output(self) -> None:
+        result = command_runner.CommandResult(("tool", "--arg"), Path("/tmp/worktree"), 2, "SECRET", "SECRET")
+        text = command_runner.format_command_failure(result)
+        self.assertNotIn("SECRET", text)
+        self.assertIn("exit code 2", text)
+
+    def test_transition_graph_rejects_skips(self) -> None:
+        with self.assertRaises(models.FlowError):
+            state.require_transition(models.WorkflowStage.FEATURE_ALLOCATED, models.WorkflowStage.COMPLETE)
+        self.assertTrue(state.allowed_transition(models.WorkflowStage.FEATURE_ALLOCATED, models.WorkflowStage.FEATURE_WORKTREE_CREATED))
+
+    def test_state_reader_rejects_duplicate_keys_and_nonstandard_numbers(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repo = root / "repo"
+            repo.mkdir()
+            git_dir = repo / ".git"
+            git_dir.mkdir()
+            store = state.WorkflowStateStore(root / "state", repo_root=repo, git_common_dir=git_dir)
+            payload = {
+                "schema_version": 2,
+                "run_id": "20260802-120000-approved-plan",
+                "slug": "approved-plan",
+                "repo_root": str(repo),
+                "git_common_dir": str(git_dir),
+                "base_branch": "main",
+                "feature_base_commit": "a" * 40,
+                "plan_title": "Approved Plan",
+                "plan_path": str(root / "plan.md"),
+                "plan_sha256": "b" * 64,
+                "feature_branch": "feature/approved-plan",
+                "feature_worktree": str(root / "feature"),
+                "harness": "omp",
+                "harness_kind": "omp",
+                "harness_dir": ".harness",
+                "implementation_model": "@default",
+                "review_model": "@slow",
+                "merge_mode": "squash",
+                "keep_worktrees": False,
+                "command_timeout_seconds": None,
+                "stage": "feature_allocated",
+                "implementation_head": None,
+                "audit_start_head": None,
+                "audit_head": None,
+                "integration_branch": None,
+                "integration_worktree": None,
+                "integration_base_commit": None,
+                "integration_feature_commit": None,
+                "integration_worktree_fingerprint": None,
+                "integration_commit": None,
+                "archive_dir": None,
+                "archive_commit": None,
+                "final_state_commit": None,
+            }
+            candidate = root / "archive" / "workflow-state.json"
+            candidate.parent.mkdir()
+            candidate.write_text(json.dumps(payload)[:-1] + ',"run_id":"duplicate"}', encoding="utf-8")
+            with self.assertRaises(models.FlowError):
+                store.read_candidate_state(candidate)
+            candidate.write_text(json.dumps(payload).replace('"command_timeout_seconds": null', '"command_timeout_seconds": NaN'), encoding="utf-8")
+            with self.assertRaises(models.FlowError):
+                store.read_candidate_state(candidate)
+            candidate.unlink()
+            outside = root / "outside.json"
+            outside.write_text("{}", encoding="utf-8")
+            candidate.symlink_to(outside)
+            with self.assertRaises(models.FlowError):
+                store.read_candidate_state(candidate)
+
+def run_git(repo: Path, *args: str) -> str:
+    result = subprocess.run(["git", *args], cwd=repo, capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        raise AssertionError(f"git {' '.join(args)} failed: {result.stderr}")
+    return result.stdout.strip()
+
+
+def snapshot_tree(root: Path) -> dict[str, bytes]:
+    result: dict[str, bytes] = {}
+    for path in root.rglob("*"):
+        if path.is_file() and "__pycache__" not in path.parts:
+            result[str(path.relative_to(root))] = path.read_bytes()
+    return result
+
+
+def make_state(
+    flow: workflow.HarnessWorktreeFlow,
+    run_id: str,
+    plan: Path,
+    base_commit: str,
+    *,
+    names: models.Names | None = None,
+    stage: models.WorkflowStage = models.WorkflowStage.FEATURE_ALLOCATED,
+) -> models.WorkflowState:
+    assert flow.git is not None
+    selected = names or models.Names("approved-plan", "feature/approved-plan", flow.repo.parent / f"{flow.repo.name}-approved-plan", run_id)
+    return models.WorkflowState(
+        schema_version=2,
+        run_id=run_id,
+        slug=selected.slug,
+        repo_root=str(flow.repo),
+        git_common_dir=str(flow.git.git_common_dir(flow.repo)),
+        base_branch="main",
+        feature_base_commit=base_commit,
+        plan_title="Approved Plan",
+        plan_path=str(plan.resolve()),
+        plan_sha256=paths.sha256_file(plan),
+        feature_branch=selected.feature_branch,
+        feature_worktree=str(selected.feature_worktree.resolve()),
+        harness="omp",
+        harness_kind="omp",
+        harness_dir=".harness",
+        implementation_model="@default",
+        review_model="@slow",
+        merge_mode="squash",
+        keep_worktrees=False,
+        command_timeout_seconds=None,
+        stage=stage,
+    )
 
 
 if __name__ == "__main__":

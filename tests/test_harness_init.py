@@ -123,6 +123,49 @@ class HarnessInitTests(unittest.TestCase):
             self.assertTrue((target / ".codex" / "skills" / "demo" / "SKILL.md").exists())
             self.assertFalse((target / ".harness").exists())
 
+    def test_installed_loadout_contains_package_and_wrapper_runs_help(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            loadout = root / "loadouts" / "custom"
+            target = root / "target"
+            loadout.mkdir(parents=True)
+            shutil.copytree(ROOT / "loadouts" / "worktrees" / ".harness", loadout / ".harness")
+            target.mkdir()
+            script, _ = copy_scripts_to_temp_root(root)
+            result = subprocess.run(
+                [
+                    "pwsh",
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(script),
+                    "-Loadout",
+                    "custom",
+                    "-Target",
+                    str(target),
+                    "-Harness",
+                    "codex",
+                ],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            wrapper = target / ".codex" / "scripts" / "worktree-flow.py"
+            self.assertTrue(wrapper.is_file())
+            self.assertTrue((target / ".codex" / "scripts" / "worktree_flow" / "cli.py").is_file())
+            help_result = subprocess.run(
+                [sys.executable, str(wrapper), "--help"],
+                cwd=target,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(help_result.returncode, 0, help_result.stderr)
+            self.assertIn("--state-dir", help_result.stdout)
+
     def test_generated_python_cache_files_are_not_copied(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
