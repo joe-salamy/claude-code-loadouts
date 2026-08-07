@@ -39,7 +39,7 @@ class IntegrationManager:
     def copy_context(self, feature_worktree: Path, integration_worktree: Path, plan_path: Path) -> Path:
         source = self.handoff(feature_worktree)
         destination = self.handoff(integration_worktree)
-        ensure_directory(destination)
+        ensure_directory(destination, mode=0o700)
         source_entries = {entry.name: entry for entry in regular_directory_entries(source)}
         for name in ARCHIVE_ALLOWLIST:
             entry = source_entries.get(name)
@@ -47,7 +47,7 @@ class IntegrationManager:
                 safe_copy(entry, destination / name)
         relative_plan = plan_path.relative_to(feature_worktree) if plan_path.is_relative_to(feature_worktree) else Path("docs") / "plans" / plan_path.name
         target_plan = integration_worktree / relative_plan
-        ensure_directory(target_plan.parent)
+        ensure_directory(target_plan.parent, mode=0o700)
         safe_copy(plan_path, target_plan)
         return target_plan
     def remove_phase_outputs(self, worktree: Path, *, phase: str) -> None:
@@ -75,7 +75,7 @@ class IntegrationManager:
         return {entry.name for entry in regular_directory_entries(archive)}
 
     def prepare_archive(self, archive: Path, *, saved_plan: Path | None = None) -> None:
-        ensure_directory(archive)
+        ensure_directory(archive, mode=0o700)
         entries = self.allowed_archive_entries(archive)
         allowed = set(ARCHIVE_ALLOWLIST) | {"plan.md", "workflow-state.json"}
         unknown = entries - allowed

@@ -158,7 +158,7 @@ class RunLock:
         self._handle: object | None = None
 
     def acquire(self) -> None:
-        ensure_directory(self.path.parent)
+        ensure_directory(self.path.parent, mode=0o700)
         if self.path.is_symlink():
             raise FlowError(f"Refusing symlinked workflow lock: {self.path}")
         flags = os.O_RDWR | os.O_CREAT
@@ -239,7 +239,7 @@ class WorkflowStateStore:
 
     def reserve_run(self, run_id: str) -> Path:
         validate_identifier(run_id, label="run id")
-        ensure_directory(self.root)
+        ensure_directory(self.root, mode=0o700)
         destination = self.root / run_id
         if destination.exists() or destination.is_symlink():
             raise FlowError(f"Workflow run directory already exists; use --resume: {destination}")
@@ -445,7 +445,7 @@ class WorkflowStateStore:
         payload = self._payload(state)
         self._state_from_data(payload, expected_run_id=state.run_id)
         path = self.state_path(state.run_id)
-        ensure_directory(path.parent)
+        ensure_directory(path.parent, mode=0o700)
         atomic_write_json(path, payload, max_bytes=MAX_STATE_BYTES)
         return path
 

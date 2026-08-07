@@ -148,22 +148,24 @@ def optional_regular_file(path: Path, *, label: str = "file") -> bool:
     return True
 
 
-def ensure_directory(path: Path, *, mode: int = 0o700) -> Path:
-    """Create a directory only after checking every existing component."""
+def ensure_directory(path: Path, *, mode: int | None = None) -> Path:
+    """Create a directory, preserving existing modes unless one is requested."""
     candidate = Path(path).expanduser()
     if not candidate.is_absolute():
         candidate = Path.cwd() / candidate
+    requested_mode = 0o700 if mode is None else mode
     reject_symlink_components(candidate, include_final=False)
     try:
-        candidate.mkdir(parents=True, exist_ok=True, mode=mode)
+        candidate.mkdir(parents=True, exist_ok=True, mode=requested_mode)
     except OSError as exc:
         raise FlowError(f"Cannot create directory: {candidate}") from exc
     reject_symlink_components(candidate, include_final=True)
-    try:
-        candidate.chmod(mode)
-    except OSError:
-        # chmod is not available/meaningful on every supported platform.
-        pass
+    if mode is not None:
+        try:
+            candidate.chmod(mode)
+        except OSError:
+            # chmod is not available/meaningful on every supported platform.
+            pass
     return candidate.resolve()
 
 

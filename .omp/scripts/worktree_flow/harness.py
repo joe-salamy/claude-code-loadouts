@@ -145,7 +145,7 @@ class HarnessAdapter:
 
     def execute(self, cwd: Path, prompt_text: str, *, phase: str) -> CommandResult:
         handoff = cwd / self.harness_dir / "handoff"
-        ensure_directory(handoff)
+        ensure_directory(handoff, mode=0o700)
         prompt = self.prompt_path(cwd, phase)
         if self.kind in {HarnessKind.OMP, HarnessKind.OPENCODE}:
             atomic_write_text(prompt, prompt_text)

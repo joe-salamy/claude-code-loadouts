@@ -157,7 +157,7 @@ class HarnessWorktreeFlow:
         self.adapter.validate(self.repo)
         self.adapter.prepare_permissions([self.repo / self.harness_dir, self.git.git_common_dir(self.repo)])
         if not resume:
-            ensure_directory(self.state_store.root)
+            ensure_directory(self.state_store.root, mode=0o700)
         return plan, digest, title, self.base
 
     def _plan_run_id(self, plan: Path) -> str | None:
@@ -283,14 +283,14 @@ class HarnessWorktreeFlow:
         if self.runner.dry_run:
             return
         self.log_file = self.workflow_log_file(worktree)
-        ensure_directory(self.log_file.parent)
+        ensure_directory(self.log_file.parent, mode=0o700)
         self.log_event("workflow_log_started", log_file=str(self.log_file), run_id=run_id)
 
     def continue_log(self, worktree: Path, run_id: str) -> None:
         if self.runner.dry_run:
             return
         self.log_file = self.workflow_log_file(worktree)
-        ensure_directory(self.log_file.parent)
+        ensure_directory(self.log_file.parent, mode=0o700)
         self.log_event("workflow_log_continued", log_file=str(self.log_file), run_id=run_id)
 
     def log_event(self, event: str, **fields: object) -> None:
@@ -322,8 +322,8 @@ class HarnessWorktreeFlow:
         )
 
     def _prepare_worktree(self, path: Path) -> None:
-        ensure_directory(path / self.handoff_dir)
-        ensure_directory(path / self.worktree_flow_dir)
+        ensure_directory(path / self.handoff_dir, mode=0o700)
+        ensure_directory(path / self.worktree_flow_dir, mode=0o700)
 
     def _allocate_feature(self, state: WorkflowState, names: Names) -> WorkflowState:
         assert self.git is not None
@@ -408,14 +408,9 @@ class HarnessWorktreeFlow:
             if optional_regular_file(path, label="generated output"):
                 safe_unlink(path)
 
-    def _summary(self, worktree: Path, name: str) -> Path:
-        path = worktree / self.handoff_dir / name
-        if optional_regular_file(path, label="phase summary"):
-            return path
-        return path
 
     def _require_summary(self, worktree: Path, name: str) -> Path:
-        path = self._summary(worktree, name)
+        path = worktree / self.handoff_dir / name
         if not optional_regular_file(path, label="phase summary"):
             raise FlowError(f"Required output file was not created: {path}")
         sha256_file(path)
@@ -425,7 +420,6 @@ class HarnessWorktreeFlow:
         assert self.adapter is not None and self.git is not None
         worktree = Path(state.feature_worktree)
         if state.stage is WorkflowStage.PLAN_COPIED:
-            self._remove_phase_outputs(worktree, "implementation")
             state = self._transition(state, WorkflowStage.IMPLEMENTATION_STARTED)
         elif state.stage is not WorkflowStage.IMPLEMENTATION_STARTED:
             return state
@@ -443,19 +437,16 @@ class HarnessWorktreeFlow:
         state = self._transition(state, WorkflowStage.IMPLEMENTATION_COMPLETE, implementation_head=head)
         self.print_checkpoint("done", "Implementation", (("summary", summary),))
         return state
-
     def _run_audit(self, state: WorkflowState, plan: Path) -> WorkflowState:
         assert self.adapter is not None and self.git is not None
         worktree = Path(state.feature_worktree)
         if state.stage is WorkflowStage.IMPLEMENTATION_COMPLETE:
-            self._remove_phase_outputs(worktree, "audit")
             start_head = self.git.head(worktree)
             state = self._transition(state, WorkflowStage.AUDIT_STARTED, audit_start_head=start_head)
         elif state.stage is WorkflowStage.AUDIT_COMPLETE:
             self._verify_plan(state)
             current = self.git.head(worktree)
             if state.audit_head != current:
-                self._remove_phase_outputs(worktree, "audit")
                 state = self._transition(state, WorkflowStage.AUDIT_STARTED, audit_start_head=current)
             else:
                 self.git.require_clean_except_artifacts(worktree, phase="Completed audit")
@@ -477,6 +468,7 @@ class HarnessWorktreeFlow:
         state = self._transition(state, WorkflowStage.AUDIT_COMPLETE, audit_head=head)
         self.print_checkpoint("done", "Audit", (("summary", summary),))
         return state
+
 
     def _run_feature_stages(self, state: WorkflowState, plan: Path) -> tuple[WorkflowState, Path]:
         state, copied_plan = self._copy_plan_stage(state, plan)

@@ -524,7 +524,7 @@ class UsageCollector:
         if self.dry_run:
             print(f"+ write {path}")
             return
-        ensure_directory(path.parent)
+        ensure_directory(path.parent, mode=0o700)
         from .paths import atomic_write_bytes, read_bytes_bounded
 
         previous = read_bytes_bounded(path, max_bytes=10 * 1024 * 1024) if optional_regular_file(path, label="usage events") else b""

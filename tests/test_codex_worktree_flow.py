@@ -73,6 +73,21 @@ class FailingRunner(FakeRunner):
         return super().run(args, cwd, check=check, capture=capture, input_text=input_text)
 
 
+class PathSafetyTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "posix", "requires POSIX directory modes")
+    def test_ensure_directory_preserves_existing_mode_unless_requested(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            existing = Path(temp) / "existing"
+            existing.mkdir()
+            existing.chmod(0o755)
+
+            paths.ensure_directory(existing)
+            self.assertEqual(stat.S_IMODE(existing.stat().st_mode), 0o755)
+
+            paths.ensure_directory(existing, mode=0o700)
+            self.assertEqual(stat.S_IMODE(existing.stat().st_mode), 0o700)
+
+
 class WorktreeFlowTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
